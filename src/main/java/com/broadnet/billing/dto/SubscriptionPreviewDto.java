@@ -8,30 +8,51 @@ import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
 
 /**
- * DTO for subscription change preview
+ * Preview of a planned subscription change — proration costs.
+ * Returned by SubscriptionManagementService.previewPlanChange().
+ *
+ * Architecture Plan §2: POST /api/billing/subscription/preview-change
+ * Uses Stripe's upcoming invoice preview API.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class SubscriptionPreviewDto {
-    
+
+    /** Current plan code. */
     private String currentPlanCode;
+    private String currentPlanName;
+
+    /** Target plan code. */
     private String newPlanCode;
-    
-    private Integer currentAmountCents;
-    private Integer newAmountCents;
+    private String newPlanName;
+    private String newBillingInterval;
+
+    /**
+     * Proration amount in cents.
+     * Positive = credit (downgrade), Negative = charge (upgrade).
+     */
     private Integer prorationAmountCents;
-    
-    private Integer amountDueTodayCents;
-    private String currency;
-    
+    private String prorationAmountFormatted;
+
+    /** When the change takes effect. */
     private LocalDateTime effectiveDate;
-    private String changeType; // immediate, scheduled
-    
-    private String description;
-    
-    // Entitlement Changes
-    private EntitlementsDto currentEntitlements;
-    private EntitlementsDto newEntitlements;
+
+    /**
+     * "immediate" — change applies now with proration.
+     * "next_renewal" — change scheduled via subscription schedule.
+     */
+    private String changeType;
+
+    /** Next invoice amount after the change (cents). */
+    private Integer nextInvoiceAmountCents;
+    private String nextInvoiceAmountFormatted;
+    private LocalDateTime nextInvoiceDate;
+
+    /** New entitlements after the change. */
+    private Integer newAnswersLimit;
+    private Integer newKbPagesLimit;
+    private Integer newAgentsLimit;
+    private Integer newUsersLimit;
 }

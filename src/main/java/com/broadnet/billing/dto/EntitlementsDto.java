@@ -5,34 +5,29 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.util.List;
-
 /**
- * DTO for company entitlements (limits)
+ * Computed entitlements snapshot.
+ * Returned by EntitlementService.computeEntitlements().
+ * Values are stored in company_billing.effective_*_limit fields.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class EntitlementsDto {
-    
+
     private String planCode;
-    private String planName;
-    private List<String> addonCodes;
     private String billingInterval;
-    
-    // Computed Limits
+
+    /** Effective answers limit (base plan + addon deltas). */
     private Integer answersLimit;
+
+    /** Effective KB pages limit. */
     private Integer kbPagesLimit;
+
+    /** Effective agents limit. */
     private Integer agentsLimit;
+
+    /** Effective users limit. */
     private Integer usersLimit;
-    
-    // Current Usage (optional, for UI)
-    private Integer answersUsed;
-    private Integer kbPagesUsed;
-    private Integer agentsUsed;
-    private Integer usersUsed;
-    
-    // Status
-    private Boolean answersBlocked;
 }

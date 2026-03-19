@@ -2,10 +2,14 @@ package com.broadnet.billing.service.impl;
 
 import com.broadnet.billing.dto.EntitlementsDto;
 import com.broadnet.billing.entity.*;
+import com.broadnet.billing.exception.OptimisticLockingException;
+import com.broadnet.billing.exception.ResourceNotFoundException;
 import com.broadnet.billing.repository.*;
 import com.broadnet.billing.service.EntitlementService;
+import com.stripe.model.Subscription;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,46 +23,58 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class EntitlementServiceImpl implements EntitlementService {
 
-    private final BillingPlansRepository plansRepository;
+    private static final int MAX_OPTIMISTIC_RETRIES = 3;
+
+    private final CompanyBillingRepository companyBillingRepository;
+    private final BillingPlansRepository billingPlansRepository;
     private final BillingPlanLimitsRepository planLimitsRepository;
     private final BillingAddonsRepository addonsRepository;
     private final BillingAddonDeltasRepository addonDeltasRepository;
-    private final CompanyBillingRepository companyBillingRepository;
     private final BillingEntitlementHistoryRepository entitlementHistoryRepository;
+    private final BillingStripePricesRepository stripePricesRepository;
+
+    // -------------------------------------------------------------------------
+    // Core computation — reads from billing_plan_limits + billing_addon_deltas
+    // -------------------------------------------------------------------------
 
     @Override
+    @Transactional(readOnly = true)
     public EntitlementsDto computeEntitlements(String planCode, List<String> addonCodes,
                                                String billingInterval) {
-        log.debug("Computing entitlements for plan {} with addons {}", planCode, addonCodes);
-
-        // Get plan
-        BillingPlan plan = plansRepository.findByPlanCode(planCode)
-                .orElseThrow(() -> new RuntimeException("Plan not found: " + planCode));
-
-        // Get plan limits
         LocalDateTime now = LocalDateTime.now();
-        List<BillingPlanLimit> limits = planLimitsRepository.findActiveLimitsByPlanIdAndInterval(
-                plan.getId(), billingInterval, now);
+        BillingPlanLimit.BillingInterval interval = BillingPlanLimit.BillingInterval.valueOf(billingInterval);
 
-        int answersLimit = getLimitValue(limits, "answers_per_period");
-        int kbPagesLimit = getLimitValue(limits, "kb_pages");
-        int agentsLimit = getLimitValue(limits, "agents");
-        int usersLimit = getLimitValue(limits, "users");
+        // 1. Load plan
+        BillingPlan plan = billingPlansRepository.findByPlanCodeAndIsActiveTrue(planCode)
+                .orElseThrow(() -> new ResourceNotFoundException("BillingPlan", "planCode", planCode));
 
-        // Add addon deltas
+        // 2. Load active limits for plan
+        List<BillingPlanLimit> limits = planLimitsRepository.findActiveLimitsByPlanId(plan.getId(), now);
+
+        int answersLimit = 0, kbPagesLimit = 0, agentsLimit = 0, usersLimit = 0;
+
+        for (BillingPlanLimit limit : limits) {
+            if (limit.getBillingInterval() != interval) continue;
+            switch (limit.getLimitType()) {
+                case answers_per_period -> answersLimit = limit.getLimitValue();
+                case kb_pages           -> kbPagesLimit = limit.getLimitValue();
+                case agents             -> agentsLimit  = limit.getLimitValue();
+                case users              -> usersLimit   = limit.getLimitValue();
+            }
+        }
+
+        // 3. Add addon deltas
         if (addonCodes != null && !addonCodes.isEmpty()) {
             List<BillingAddon> addons = addonsRepository.findByAddonCodesAndActive(addonCodes);
-            List<Long> addonIds = addons.stream().map(BillingAddon::getId).collect(Collectors.toList());
-
-            List<BillingAddonDelta> deltas = addonDeltasRepository.findActiveDeltasByAddonIds(
-                    addonIds, now);
-
-            for (BillingAddonDelta delta : deltas) {
-                if (delta.getBillingInterval().equals(billingInterval)) {
-                    if ("answers_per_period".equals(delta.getDeltaType())) {
-                        answersLimit += delta.getDeltaValue();
-                    } else if ("kb_pages".equals(delta.getDeltaType())) {
-                        kbPagesLimit += delta.getDeltaValue();
+            for (BillingAddon addon : addons) {
+                List<BillingAddonDelta> deltas =
+                        addonDeltasRepository.findActiveDeltasByAddonId(addon.getId(), now);
+                for (BillingAddonDelta delta : deltas) {
+                    if (delta.getBillingInterval() != BillingAddonDelta.BillingInterval.valueOf(billingInterval))
+                        continue;
+                    switch (delta.getDeltaType()) {
+                        case answers_per_period -> answersLimit += delta.getDeltaValue();
+                        case kb_pages           -> kbPagesLimit += delta.getDeltaValue();
                     }
                 }
             }
@@ -66,8 +82,6 @@ public class EntitlementServiceImpl implements EntitlementService {
 
         return EntitlementsDto.builder()
                 .planCode(planCode)
-                .planName(plan.getPlanName())
-                .addonCodes(addonCodes != null ? addonCodes : new ArrayList<>())
                 .billingInterval(billingInterval)
                 .answersLimit(answersLimit)
                 .kbPagesLimit(kbPagesLimit)
@@ -77,134 +91,244 @@ public class EntitlementServiceImpl implements EntitlementService {
     }
 
     @Override
+    @Transactional(readOnly = true)
+    public EntitlementsDto computeEntitlementsForCompany(Long companyId) {
+        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
+
+        String planCode = billing.getActivePlanCode();
+        if (planCode == null) {
+            return EntitlementsDto.builder().planCode(null).answersLimit(0)
+                    .kbPagesLimit(0).agentsLimit(0).usersLimit(0).build();
+        }
+
+        List<String> addonCodes = billing.getActiveAddonCodes() != null
+                ? billing.getActiveAddonCodes() : List.of();
+        String interval = billing.getBillingInterval() != null
+                ? billing.getBillingInterval().name() : "month";
+
+        return computeEntitlements(planCode, addonCodes, interval);
+    }
+
+    // -------------------------------------------------------------------------
+    // Update from Stripe subscription object
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional
+    public void updateEntitlementsFromSubscription(Long companyId,
+                                                   Subscription stripeSubscription,
+                                                   BillingEntitlementHistory.TriggeredBy triggeredBy,
+                                                   String stripeEventId) {
+        // Extract plan lookup key from subscription items
+        String planLookupKey = extractPlanLookupKey(stripeSubscription);
+        List<String> addonLookupKeys = extractAddonLookupKeys(stripeSubscription);
+
+        // Resolve plan code from stripe price lookup key
+        String planCode = resolvePlanCode(planLookupKey);
+        List<String> addonCodes = resolveAddonCodes(addonLookupKeys);
+
+        String interval = stripeSubscription.getItems().getData().stream()
+                .filter(item -> item.getPrice().getLookupKey() != null
+                        && item.getPrice().getLookupKey().startsWith("plan_"))
+                .map(item -> item.getPrice().getRecurring().getInterval())
+                .findFirst().orElse("month");
+
+        EntitlementsDto entitlements = computeEntitlements(planCode, addonCodes, interval);
+        updateCompanyEntitlements(companyId, entitlements, triggeredBy, stripeEventId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Persist computed entitlements — optimistic locking with retry
+    // -------------------------------------------------------------------------
+
+    @Override
     @Transactional
     public void updateCompanyEntitlements(Long companyId, EntitlementsDto entitlements,
-                                          String triggeredBy, String stripeEventId) {
-        log.info("Updating entitlements for company {}", companyId);
-
-        int maxRetries = 3;
-        for (int i = 0; i < maxRetries; i++) {
+                                          BillingEntitlementHistory.TriggeredBy triggeredBy,
+                                          String stripeEventId) {
+        int attempt = 0;
+        while (attempt < MAX_OPTIMISTIC_RETRIES) {
             try {
+                attempt++;
                 CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                        .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                        .orElseThrow(() -> new ResourceNotFoundException(
+                                "CompanyBilling", "companyId", companyId));
 
-                // Store old values for history
-                Integer oldAnswersLimit = billing.getEffectiveAnswersLimit();
-                Integer oldKbPagesLimit = billing.getEffectiveKbPagesLimit();
-                Integer oldAgentsLimit = billing.getEffectiveAgentsLimit();
-                Integer oldUsersLimit = billing.getEffectiveUsersLimit();
-                String oldPlanCode = billing.getActivePlanCode();
-                List<String> oldAddonCodes = billing.getActiveAddonCodes();
+                // Snapshot old values for history
+                Integer oldAnswers = billing.getEffectiveAnswersLimit();
+                Integer oldKb     = billing.getEffectiveKbPagesLimit();
+                Integer oldAgents = billing.getEffectiveAgentsLimit();
+                Integer oldUsers  = billing.getEffectiveUsersLimit();
+                String  oldPlan   = billing.getActivePlanCode();
 
-                // Update entitlements
+                // Apply new entitlements
                 billing.setActivePlanCode(entitlements.getPlanCode());
                 billing.setEffectiveAnswersLimit(entitlements.getAnswersLimit());
                 billing.setEffectiveKbPagesLimit(entitlements.getKbPagesLimit());
                 billing.setEffectiveAgentsLimit(entitlements.getAgentsLimit());
                 billing.setEffectiveUsersLimit(entitlements.getUsersLimit());
-                billing.setActiveAddonCodes(entitlements.getAddonCodes());
                 billing.setLastSyncAt(LocalDateTime.now());
+
+                // Unblock answers if new limit > current usage
+                if (billing.getAnswersBlocked()
+                        && billing.getAnswersUsedInPeriod() < entitlements.getAnswersLimit()) {
+                    billing.setAnswersBlocked(false);
+                }
 
                 companyBillingRepository.save(billing);
 
-                // Log entitlement history
-                logEntitlementChange(companyId, oldPlanCode, entitlements.getPlanCode(),
-                        oldAddonCodes, entitlements.getAddonCodes(),
-                        oldAnswersLimit, entitlements.getAnswersLimit(),
-                        oldKbPagesLimit, entitlements.getKbPagesLimit(),
-                        oldAgentsLimit, entitlements.getAgentsLimit(),
-                        oldUsersLimit, entitlements.getUsersLimit(),
+                // Log to entitlement history
+                logEntitlementHistory(companyId, oldPlan, entitlements.getPlanCode(),
+                        oldAnswers, entitlements.getAnswersLimit(),
+                        oldKb, entitlements.getKbPagesLimit(),
+                        oldAgents, entitlements.getAgentsLimit(),
+                        oldUsers, entitlements.getUsersLimit(),
                         triggeredBy, stripeEventId);
 
+                log.info("Updated entitlements for companyId={}: answers={}, kb={}, agents={}, users={}",
+                        companyId, entitlements.getAnswersLimit(), entitlements.getKbPagesLimit(),
+                        entitlements.getAgentsLimit(), entitlements.getUsersLimit());
                 return;
-            } catch (Exception e) {
-                if (i == maxRetries - 1) throw e;
-                log.warn("Retry {} for updating entitlements", i + 1);
+
+            } catch (OptimisticLockingFailureException e) {
+                if (attempt >= MAX_OPTIMISTIC_RETRIES) {
+                    throw new OptimisticLockingException(
+                            "Failed to update entitlements for companyId " + companyId
+                                    + " after " + MAX_OPTIMISTIC_RETRIES + " retries", e);
+                }
+                log.warn("Optimistic lock conflict updating entitlements for companyId={}, attempt {}",
+                        companyId, attempt);
+                // small back-off before retry
+                try { Thread.sleep(50L * attempt); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Recompute for all companies on a plan (after admin limit change)
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional
     public int recomputeEntitlementsForPlan(String planCode) {
-        log.info("Recomputing entitlements for all companies on plan: {}", planCode);
-
-        List<CompanyBilling> companies = companyBillingRepository.findByActivePlanCode(planCode);
-
-        for (CompanyBilling billing : companies) {
-            EntitlementsDto entitlements = computeEntitlements(
-                    billing.getActivePlanCode(),
-                    billing.getActiveAddonCodes(),
-                    billing.getBillingInterval()
-            );
-
-            updateCompanyEntitlements(billing.getCompanyId(), entitlements, "admin", null);
+        List<CompanyBilling> billings = companyBillingRepository.findByActivePlanCode(planCode);
+        int count = 0;
+        for (CompanyBilling billing : billings) {
+            try {
+                EntitlementsDto entitlements = computeEntitlementsForCompany(billing.getCompanyId());
+                updateCompanyEntitlements(billing.getCompanyId(), entitlements,
+                        BillingEntitlementHistory.TriggeredBy.admin, null);
+                count++;
+            } catch (Exception e) {
+                log.error("Failed to recompute entitlements for companyId={}: {}",
+                        billing.getCompanyId(), e.getMessage());
+            }
         }
-
-        return companies.size();
+        log.info("Recomputed entitlements for {} companies on plan {}", count, planCode);
+        return count;
     }
 
+    // -------------------------------------------------------------------------
+    // Read current snapshot (fast path — no re-computation)
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
     public EntitlementsDto getCurrentEntitlements(Long companyId) {
         CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        EntitlementsDto dto = EntitlementsDto.builder()
+        return EntitlementsDto.builder()
                 .planCode(billing.getActivePlanCode())
-                .addonCodes(billing.getActiveAddonCodes())
-                .billingInterval(billing.getBillingInterval())
+                .billingInterval(billing.getBillingInterval() != null
+                        ? billing.getBillingInterval().name() : null)
                 .answersLimit(billing.getEffectiveAnswersLimit())
                 .kbPagesLimit(billing.getEffectiveKbPagesLimit())
                 .agentsLimit(billing.getEffectiveAgentsLimit())
                 .usersLimit(billing.getEffectiveUsersLimit())
-                .answersUsed(billing.getAnswersUsedInPeriod())
-                .kbPagesUsed(billing.getKbPagesTotal())
-                .agentsUsed(billing.getAgentsTotal())
-                .usersUsed(billing.getUsersTotal())
-                .answersBlocked(billing.getAnswersBlocked())
                 .build();
-
-        return dto;
     }
 
+    // -------------------------------------------------------------------------
+    // Preview (no DB write)
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
     public EntitlementsDto previewEntitlements(String planCode, List<String> addonCodes,
                                                String billingInterval) {
         return computeEntitlements(planCode, addonCodes, billingInterval);
     }
 
-    private int getLimitValue(List<BillingPlanLimit> limits, String limitType) {
-        return limits.stream()
-                .filter(l -> l.getLimitType().equals(limitType))
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    private String extractPlanLookupKey(Subscription subscription) {
+        return subscription.getItems().getData().stream()
+                .filter(item -> item.getPrice().getLookupKey() != null
+                        && item.getPrice().getLookupKey().startsWith("plan_"))
+                .map(item -> item.getPrice().getLookupKey())
                 .findFirst()
-                .map(BillingPlanLimit::getLimitValue)
-                .orElse(0);
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No plan found in subscription: " + subscription.getId()));
     }
 
-    private void logEntitlementChange(Long companyId, String oldPlanCode, String newPlanCode,
-                                      List<String> oldAddonCodes, List<String> newAddonCodes,
-                                      Integer oldAnswersLimit, Integer newAnswersLimit,
-                                      Integer oldKbPagesLimit, Integer newKbPagesLimit,
-                                      Integer oldAgentsLimit, Integer newAgentsLimit,
-                                      Integer oldUsersLimit, Integer newUsersLimit,
-                                      String triggeredBy, String stripeEventId) {
+    private List<String> extractAddonLookupKeys(Subscription subscription) {
+        return subscription.getItems().getData().stream()
+                .filter(item -> item.getPrice().getLookupKey() != null
+                        && item.getPrice().getLookupKey().startsWith("addon_"))
+                .map(item -> item.getPrice().getLookupKey())
+                .collect(Collectors.toList());
+    }
 
-        String changeType = determineChangeType(oldPlanCode, newPlanCode, oldAddonCodes, newAddonCodes);
+    private String resolvePlanCode(String lookupKey) {
+        // lookup_key format: "plan_{planCode}_{interval}" e.g. "plan_professional_month"
+        return stripePricesRepository.findByLookupKey(lookupKey)
+                .map(price -> price.getPlan() != null ? price.getPlan().getPlanCode() : null)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "BillingStripePrice", "lookupKey", lookupKey));
+    }
+
+    private List<String> resolveAddonCodes(List<String> lookupKeys) {
+        List<String> codes = new ArrayList<>();
+        for (String lk : lookupKeys) {
+            stripePricesRepository.findByLookupKey(lk).ifPresent(price -> {
+                if (price.getAddon() != null) codes.add(price.getAddon().getAddonCode());
+            });
+        }
+        return codes;
+    }
+
+    private void logEntitlementHistory(Long companyId,
+                                       String oldPlanCode, String newPlanCode,
+                                       Integer oldAnswers, Integer newAnswers,
+                                       Integer oldKb, Integer newKb,
+                                       Integer oldAgents, Integer newAgents,
+                                       Integer oldUsers, Integer newUsers,
+                                       BillingEntitlementHistory.TriggeredBy triggeredBy,
+                                       String stripeEventId) {
+        BillingEntitlementHistory.ChangeType changeType =
+                (oldPlanCode != null && !oldPlanCode.equals(newPlanCode))
+                        ? BillingEntitlementHistory.ChangeType.plan_change
+                        : BillingEntitlementHistory.ChangeType.limit_update;
 
         BillingEntitlementHistory history = BillingEntitlementHistory.builder()
                 .companyId(companyId)
                 .changeType(changeType)
                 .oldPlanCode(oldPlanCode)
                 .newPlanCode(newPlanCode)
-                .oldAddonCodes(oldAddonCodes)
-                .newAddonCodes(newAddonCodes)
-                .oldAnswersLimit(oldAnswersLimit)
-                .newAnswersLimit(newAnswersLimit)
-                .oldKbPagesLimit(oldKbPagesLimit)
-                .newKbPagesLimit(newKbPagesLimit)
-                .oldAgentsLimit(oldAgentsLimit)
-                .newAgentsLimit(newAgentsLimit)
-                .oldUsersLimit(oldUsersLimit)
-                .newUsersLimit(newUsersLimit)
+                .oldAnswersLimit(oldAnswers)
+                .newAnswersLimit(newAnswers)
+                .oldKbPagesLimit(oldKb)
+                .newKbPagesLimit(newKb)
+                .oldAgentsLimit(oldAgents)
+                .newAgentsLimit(newAgents)
+                .oldUsersLimit(oldUsers)
+                .newUsersLimit(newUsers)
                 .triggeredBy(triggeredBy)
                 .stripeEventId(stripeEventId)
                 .effectiveDate(LocalDateTime.now())
@@ -212,75 +336,4 @@ public class EntitlementServiceImpl implements EntitlementService {
 
         entitlementHistoryRepository.save(history);
     }
-
-    private String determineChangeType(String oldPlan, String newPlan,
-                                       List<String> oldAddons, List<String> newAddons) {
-        if (oldPlan == null || !oldPlan.equals(newPlan)) {
-            return "plan_change";
-        }
-
-        if (oldAddons == null) oldAddons = new ArrayList<>();
-        if (newAddons == null) newAddons = new ArrayList<>();
-
-        if (newAddons.size() > oldAddons.size()) {
-            return "addon_added";
-        } else if (newAddons.size() < oldAddons.size()) {
-            return "addon_removed";
-        }
-
-        return "limit_update";
-    }
-
-    @Override
-    public EntitlementsDto computeEntitlementsForCompany(Long companyId) {
-        log.debug("Computing entitlements for company {}", companyId);
-
-        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
-
-        return computeEntitlements(
-                billing.getActivePlanCode(),
-                billing.getActiveAddonCodes(),
-                billing.getBillingInterval()
-        );
-    }
-
-    @Override
-    @Transactional
-    public void updateEntitlementsFromSubscription(Long companyId,
-                                                   com.stripe.model.Subscription subscription,
-                                                   String triggeredBy,
-                                                   String stripeEventId) {
-        log.info("Updating entitlements from Stripe subscription for company {}", companyId);
-
-        // Extract plan code and addon codes from subscription items
-        String planCode = null;
-        List<String> addonCodes = new ArrayList<>();
-        String billingInterval = null;
-
-        for (com.stripe.model.SubscriptionItem item : subscription.getItems().getData()) {
-            com.stripe.model.Price price = item.getPrice();
-            if (price.getProductObject() != null && price.getProductObject().getMetadata() != null) {
-                String type = price.getProductObject().getMetadata().get("type");
-
-                if ("plan".equals(type)) {
-                    planCode = price.getProductObject().getMetadata().get("plan_code");
-                    billingInterval = price.getRecurring().getInterval();
-                } else if ("addon".equals(type)) {
-                    String addonCode = price.getProductObject().getMetadata().get("addon_code");
-                    if (addonCode != null) {
-                        addonCodes.add(addonCode);
-                    }
-                }
-            }
-        }
-
-        if (planCode != null && billingInterval != null) {
-            EntitlementsDto entitlements = computeEntitlements(planCode, addonCodes, billingInterval);
-            updateCompanyEntitlements(companyId, entitlements, triggeredBy, stripeEventId);
-        } else {
-            log.error("Failed to extract plan code or billing interval from subscription");
-        }
-    }
-
 }

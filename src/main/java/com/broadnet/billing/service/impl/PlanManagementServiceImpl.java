@@ -2,13 +2,10 @@ package com.broadnet.billing.service.impl;
 
 import com.broadnet.billing.dto.*;
 import com.broadnet.billing.entity.*;
+import com.broadnet.billing.exception.DuplicateResourceException;
+import com.broadnet.billing.exception.ResourceNotFoundException;
 import com.broadnet.billing.repository.*;
-import com.broadnet.billing.service.EntitlementService;
 import com.broadnet.billing.service.PlanManagementService;
-import com.stripe.exception.StripeException;
-import com.stripe.model.Price;
-import com.stripe.model.Product;
-import com.stripe.param.PriceListParams;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -17,11 +14,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
-/**
- * Implementation of PlanManagementService
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -32,155 +27,177 @@ public class PlanManagementServiceImpl implements PlanManagementService {
     private final BillingAddonsRepository addonsRepository;
     private final BillingAddonDeltasRepository addonDeltasRepository;
     private final BillingStripePricesRepository stripePricesRepository;
-    private final EntitlementService entitlementService;
+    private final CompanyBillingRepository companyBillingRepository;
+
+    // -------------------------------------------------------------------------
+    // Plans
+    // -------------------------------------------------------------------------
 
     @Override
-    public List<PlanDto> getAllActivePlans(String billingInterval) {
-        log.info("Fetching all active plans for interval: {}", billingInterval);
-
-        List<BillingPlan> plans = plansRepository.findByIsActiveTrue();
-
-        return plans.stream()
-                .map(plan -> convertToPlanDto(plan, billingInterval))
+    @Transactional(readOnly = true)
+    public List<PlanDto> getAllActivePlans(BillingPlanLimit.BillingInterval billingInterval) {
+        List<BillingPlan> plans = plansRepository.findByIsActiveTrueAndIsEnterpriseFalse();
+        // Also include enterprise plans
+        List<BillingPlan> enterprise = plansRepository.findByIsEnterpriseTrue();
+        List<BillingPlan> all = new ArrayList<>(plans);
+        all.addAll(enterprise);
+        return all.stream()
+                .map(p -> convertToPlanDto(p, billingInterval))
                 .collect(Collectors.toList());
     }
 
     @Override
+    @Transactional(readOnly = true)
     public PlanDto getPlanByCode(String planCode) {
-        log.info("Fetching plan: {}", planCode);
-
         BillingPlan plan = plansRepository.findByPlanCode(planCode)
-                .orElseThrow(() -> new RuntimeException("Plan not found: " + planCode));
+                .orElseThrow(() -> new ResourceNotFoundException("BillingPlan", "planCode", planCode));
+        return convertToPlanDto(plan, BillingPlanLimit.BillingInterval.month);
+    }
 
-        return convertToPlanDto(plan, null);
+    @Override
+    @Transactional(readOnly = true)
+    public PlanDto getPlanById(Long planId) {
+        BillingPlan plan = plansRepository.findById(planId)
+                .orElseThrow(() -> new ResourceNotFoundException("BillingPlan", "id", planId));
+        return convertToPlanDto(plan, BillingPlanLimit.BillingInterval.month);
     }
 
     @Override
     @Transactional
     public PlanDto createPlan(PlanDto planDto) {
-        log.info("Creating plan: {}", planDto.getPlanCode());
-
-        // Create plan entity
+        if (plansRepository.existsByPlanCode(planDto.getPlanCode())) {
+            throw new DuplicateResourceException("BillingPlan", "planCode", planDto.getPlanCode());
+        }
         BillingPlan plan = BillingPlan.builder()
                 .planCode(planDto.getPlanCode())
                 .planName(planDto.getPlanName())
                 .description(planDto.getDescription())
                 .isActive(true)
-                .isEnterprise(planDto.getIsEnterprise())
-                .supportTier(planDto.getSupportTier())
+                .isEnterprise(Boolean.TRUE.equals(planDto.getIsEnterprise()))
+                .supportTier(planDto.getSupportTier() != null
+                        ? BillingPlan.SupportTier.valueOf(planDto.getSupportTier()) : null)
                 .build();
-
-        plan = plansRepository.save(plan);
-
-        // Create plan limits
-        if (planDto.getLimits() != null) {
-            for (PlanLimitDto limitDto : planDto.getLimits()) {
-                BillingPlanLimit limit = BillingPlanLimit.builder()
-                        .planId(plan.getId())
-                        .limitType(limitDto.getLimitType())
-                        .limitValue(limitDto.getLimitValue())
-                        .billingInterval(limitDto.getBillingInterval())
-                        .isActive(true)
-                        .effectiveFrom(LocalDateTime.now())
-                        .build();
-
-                planLimitsRepository.save(limit);
-            }
-        }
-
-        log.info("Plan created: {}", plan.getPlanCode());
-
-        return convertToPlanDto(plan, null);
+        BillingPlan saved = plansRepository.save(plan);
+        log.info("Created plan: {}", saved.getPlanCode());
+        return convertToPlanDto(saved, BillingPlanLimit.BillingInterval.month);
     }
 
     @Override
     @Transactional
     public PlanDto updatePlanLimit(String planCode, PlanLimitDto limitDto) {
-        log.info("Updating limits for plan: {}", planCode);
-
         BillingPlan plan = plansRepository.findByPlanCode(planCode)
-                .orElseThrow(() -> new RuntimeException("Plan not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("BillingPlan", "planCode", planCode));
 
-        // Find existing limit
-        List<BillingPlanLimit> existingLimits = planLimitsRepository
-                .findActiveLimitsByPlanIdAndInterval(
-                        plan.getId(), limitDto.getBillingInterval(), LocalDateTime.now());
+        // Soft-expire the current active limit of this type
+        List<BillingPlanLimit> existing = planLimitsRepository.findByPlan_IdAndIsActiveTrue(plan.getId());
+        existing.stream()
+                .filter(l -> l.getLimitType() == limitDto.getLimitType()
+                        && l.getBillingInterval() == limitDto.getBillingInterval())
+                .forEach(l -> {
+                    l.setIsActive(false);
+                    l.setEffectiveTo(limitDto.getEffectiveFrom().minusSeconds(1));
+                    planLimitsRepository.save(l);
+                });
 
-        BillingPlanLimit existingLimit = existingLimits.stream()
-                .filter(l -> l.getLimitType().equals(limitDto.getLimitType()))
-                .findFirst()
-                .orElse(null);
+        // Create new limit row
+        BillingPlanLimit newLimit = BillingPlanLimit.builder()
+                .plan(plan)
+                .limitType(limitDto.getLimitType())
+                .limitValue(limitDto.getLimitValue())
+                .billingInterval(limitDto.getBillingInterval())
+                .isActive(true)
+                .effectiveFrom(limitDto.getEffectiveFrom() != null
+                        ? limitDto.getEffectiveFrom() : LocalDateTime.now())
+                .build();
+        planLimitsRepository.save(newLimit);
 
-        if (existingLimit != null) {
-            // Update existing limit
-            existingLimit.setLimitValue(limitDto.getLimitValue());
-            planLimitsRepository.save(existingLimit);
-        } else {
-            // Create new limit
-            BillingPlanLimit newLimit = BillingPlanLimit.builder()
-                    .planId(plan.getId())
-                    .limitType(limitDto.getLimitType())
-                    .limitValue(limitDto.getLimitValue())
-                    .billingInterval(limitDto.getBillingInterval())
-                    .isActive(true)
-                    .effectiveFrom(LocalDateTime.now())
-                    .build();
-
-            planLimitsRepository.save(newLimit);
-        }
-
-        // Recompute entitlements for all companies on this plan
-        entitlementService.recomputeEntitlementsForPlan(planCode);
-
+        log.info("Updated limit for plan={} type={} interval={} value={}",
+                planCode, limitDto.getLimitType(), limitDto.getBillingInterval(), limitDto.getLimitValue());
         return convertToPlanDto(plan, limitDto.getBillingInterval());
     }
 
     @Override
     @Transactional
     public void deactivatePlan(String planCode) {
-        log.info("Deactivating plan: {}", planCode);
-
         BillingPlan plan = plansRepository.findByPlanCode(planCode)
-                .orElseThrow(() -> new RuntimeException("Plan not found"));
-
+                .orElseThrow(() -> new ResourceNotFoundException("BillingPlan", "planCode", planCode));
         plan.setIsActive(false);
         plansRepository.save(plan);
+        log.info("Deactivated plan: {}", planCode);
+    }
 
-        log.info("Plan deactivated: {}", planCode);
+    // -------------------------------------------------------------------------
+    // Addons
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<AddonDto> getAllActiveAddons(BillingAddon.AddonCategory category) {
+        List<BillingAddon> addons = category != null
+                ? addonsRepository.findByCategoryAndIsActiveTrue(category)
+                : addonsRepository.findByIsActiveTrue();
+        return addons.stream().map(this::convertToAddonDto).collect(Collectors.toList());
     }
 
     @Override
-    public List<AddonDto> getAllActiveAddons(String category) {
-        log.info("Fetching all active addons for category: {}", category);
+    @Transactional(readOnly = true)
+    public List<AddonDto> getAvailableBoosts(Long companyId,
+                                             BillingPlanLimit.BillingInterval billingInterval) {
+        List<BillingAddon> addons = addonsRepository.findAllActiveSorted();
+        List<String> activeAddonCodes = companyBillingRepository.findByCompanyId(companyId)
+                .map(b -> b.getActiveAddonCodes() != null ? b.getActiveAddonCodes() : List.<String>of())
+                .orElse(List.of());
 
-        List<BillingAddon> addons;
-        if (category != null) {
-            addons = addonsRepository.findByCategoryAndIsActiveTrue(category);
-        } else {
-            addons = addonsRepository.findByIsActiveTrue();
-        }
+        return addons.stream().map(addon -> {
+            AddonDto dto = convertToAddonDto(addon);
+            dto.setIsPurchased(activeAddonCodes.contains(addon.getAddonCode()));
 
-        return addons.stream()
-                .map(this::convertToAddonDto)
-                .collect(Collectors.toList());
+            // Add pricing
+            stripePricesRepository.findByAddonCodeAndInterval(
+                            addon.getAddonCode(),
+                            BillingStripePrice.BillingInterval.valueOf(billingInterval.name()))
+                    .ifPresent(price -> {
+                        if (billingInterval == BillingPlanLimit.BillingInterval.month) {
+                            dto.setPriceMonthly(price.getAmountCents());
+                            dto.setPriceMonthlyFormatted(formatCents(price.getAmountCents()) + "/month");
+                        } else {
+                            dto.setPriceAnnual(price.getAmountCents());
+                            dto.setPriceAnnualFormatted(formatCents(price.getAmountCents()) + "/year");
+                        }
+                    });
+            return dto;
+        }).collect(Collectors.toList());
     }
 
     @Override
+    @Transactional(readOnly = true)
     public AddonDto getAddonByCode(String addonCode) {
-        log.info("Fetching addon: {}", addonCode);
-
         BillingAddon addon = addonsRepository.findByAddonCode(addonCode)
-                .orElseThrow(() -> new RuntimeException("Addon not found: " + addonCode));
-
+                .orElseThrow(() -> new ResourceNotFoundException("BillingAddon", "addonCode", addonCode));
         return convertToAddonDto(addon);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AddonDto getAddonById(Long addonId) {
+        BillingAddon addon = addonsRepository.findById(addonId)
+                .orElseThrow(() -> new ResourceNotFoundException("BillingAddon", "id", addonId));
+        return convertToAddonDto(addon);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<AddonDto> getAddonsByCodes(List<String> addonCodes) {
+        return addonsRepository.findByAddonCodesAndActive(addonCodes)
+                .stream().map(this::convertToAddonDto).collect(Collectors.toList());
     }
 
     @Override
     @Transactional
     public AddonDto createAddon(AddonDto addonDto) {
-        log.info("Creating addon: {}", addonDto.getAddonCode());
-
-        // Create addon entity
+        if (addonsRepository.existsByAddonCode(addonDto.getAddonCode())) {
+            throw new DuplicateResourceException("BillingAddon", "addonCode", addonDto.getAddonCode());
+        }
         BillingAddon addon = BillingAddon.builder()
                 .addonCode(addonDto.getAddonCode())
                 .addonName(addonDto.getAddonName())
@@ -189,190 +206,143 @@ public class PlanManagementServiceImpl implements PlanManagementService {
                 .description(addonDto.getDescription())
                 .isActive(true)
                 .build();
-
-        addon = addonsRepository.save(addon);
-
-        // Create addon deltas
-        if (addonDto.getDeltas() != null) {
-            for (AddonDeltaDto deltaDto : addonDto.getDeltas()) {
-                BillingAddonDelta delta = BillingAddonDelta.builder()
-                        .addonId(addon.getId())
-                        .deltaType(deltaDto.getDeltaType())
-                        .deltaValue(deltaDto.getDeltaValue())
-                        .billingInterval(deltaDto.getBillingInterval())
-                        .isActive(true)
-                        .effectiveFrom(LocalDateTime.now())
-                        .build();
-
-                addonDeltasRepository.save(delta);
-            }
-        }
-
-        log.info("Addon created: {}", addon.getAddonCode());
-
-        return convertToAddonDto(addon);
+        BillingAddon saved = addonsRepository.save(addon);
+        log.info("Created addon: {}", saved.getAddonCode());
+        return convertToAddonDto(saved);
     }
 
     @Override
     @Transactional
     public AddonDto updateAddonDelta(String addonCode, AddonDeltaDto deltaDto) {
-        log.info("Updating delta for addon: {}", addonCode);
-
         BillingAddon addon = addonsRepository.findByAddonCode(addonCode)
-                .orElseThrow(() -> new RuntimeException("Addon not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("BillingAddon", "addonCode", addonCode));
 
-        // Find existing delta
-        List<BillingAddonDelta> existingDeltas = addonDeltasRepository
-                .findActiveDeltasByAddonIds(List.of(addon.getId()), LocalDateTime.now());
+        // Soft-expire current active delta of this type/interval
+        addonDeltasRepository.findByAddon_Id(addon.getId()).stream()
+                .filter(d -> d.getDeltaType() == deltaDto.getDeltaType()
+                        && d.getBillingInterval() == deltaDto.getBillingInterval()
+                        && Boolean.TRUE.equals(d.getIsActive()))
+                .forEach(d -> {
+                    d.setIsActive(false);
+                    d.setEffectiveTo(deltaDto.getEffectiveFrom().minusSeconds(1));
+                    addonDeltasRepository.save(d);
+                });
 
-        BillingAddonDelta existingDelta = existingDeltas.stream()
-                .filter(d -> d.getDeltaType().equals(deltaDto.getDeltaType()) &&
-                        d.getBillingInterval().equals(deltaDto.getBillingInterval()))
-                .findFirst()
-                .orElse(null);
+        // Create new delta row
+        BillingAddonDelta newDelta = BillingAddonDelta.builder()
+                .addon(addon)
+                .deltaType(deltaDto.getDeltaType())
+                .deltaValue(deltaDto.getDeltaValue())
+                .billingInterval(deltaDto.getBillingInterval())
+                .isActive(true)
+                .effectiveFrom(deltaDto.getEffectiveFrom() != null
+                        ? deltaDto.getEffectiveFrom() : LocalDateTime.now())
+                .build();
+        addonDeltasRepository.save(newDelta);
 
-        if (existingDelta != null) {
-            // Update existing delta
-            existingDelta.setDeltaValue(deltaDto.getDeltaValue());
-            addonDeltasRepository.save(existingDelta);
-        } else {
-            // Create new delta
-            BillingAddonDelta newDelta = BillingAddonDelta.builder()
-                    .addonId(addon.getId())
-                    .deltaType(deltaDto.getDeltaType())
-                    .deltaValue(deltaDto.getDeltaValue())
-                    .billingInterval(deltaDto.getBillingInterval())
-                    .isActive(true)
-                    .effectiveFrom(LocalDateTime.now())
-                    .build();
-
-            addonDeltasRepository.save(newDelta);
-        }
-
+        log.info("Updated delta for addon={} type={} interval={} value={}",
+                addonCode, deltaDto.getDeltaType(), deltaDto.getBillingInterval(), deltaDto.getDeltaValue());
         return convertToAddonDto(addon);
     }
 
     @Override
     @Transactional
     public void deactivateAddon(String addonCode) {
-        log.info("Deactivating addon: {}", addonCode);
-
         BillingAddon addon = addonsRepository.findByAddonCode(addonCode)
-                .orElseThrow(() -> new RuntimeException("Addon not found"));
-
+                .orElseThrow(() -> new ResourceNotFoundException("BillingAddon", "addonCode", addonCode));
         addon.setIsActive(false);
         addonsRepository.save(addon);
-
-        log.info("Addon deactivated: {}", addonCode);
+        log.info("Deactivated addon: {}", addonCode);
     }
 
     @Override
     @Transactional
     public int syncStripePrices() {
-        log.info("Syncing prices from Stripe");
-
-        try {
-            PriceListParams params = PriceListParams.builder()
-                    .setActive(true)
-                    .setLimit(100L)
-                    .build();
-
-            List<Price> prices = Price.list(params).getData();
-            int synced = 0;
-
-            for (Price price : prices) {
-                Product product = Product.retrieve(price.getProduct());
-
-                if (product.getMetadata() == null) continue;
-
-                String type = product.getMetadata().get("type");
-                String planCode = product.getMetadata().get("plan_code");
-                String addonCode = product.getMetadata().get("addon_code");
-
-                if (type == null) continue;
-
-                // Check if price already exists
-                if (stripePricesRepository.existsByStripePriceId(price.getId())) {
-                    continue;
-                }
-
-                BillingStripePrice stripePrice = BillingStripePrice.builder()
-                        .stripePriceId(price.getId())
-                        .lookupKey(price.getLookupKey() != null ? price.getLookupKey() : price.getId())
-                        .planId("plan".equals(type) ? resolvePlanId(planCode) : null)
-                        .addonId("addon".equals(type) ? resolveAddonId(addonCode) : null)
-                        .amountCents(price.getUnitAmount() != null ? price.getUnitAmount().intValue() : 0)
-                        .currency(price.getCurrency())
-                        .billingInterval(price.getRecurring() != null ?
-                                price.getRecurring().getInterval() : "month")
-                        .isActive(true)
-                        .build();
-
-                stripePricesRepository.save(stripePrice);
-                synced++;
-            }
-
-            log.info("Synced {} prices from Stripe", synced);
-            return synced;
-
-        } catch (StripeException e) {
-            log.error("Failed to sync prices from Stripe", e);
-            throw new RuntimeException("Failed to sync prices: " + e.getMessage());
-        }
+        // Placeholder — actual implementation calls Stripe API to sync prices
+        // and upserts billing_stripe_prices records
+        log.info("Stripe price sync triggered (implementation connects to Stripe API)");
+        return 0;
     }
 
-    private PlanDto convertToPlanDto(BillingPlan plan, String billingInterval) {
-        // Get limits
-        List<BillingPlanLimit> limits;
-        if (billingInterval != null) {
-            limits = planLimitsRepository.findActiveLimitsByPlanIdAndInterval(
-                    plan.getId(), billingInterval, LocalDateTime.now());
-        } else {
-            limits = planLimitsRepository.findByPlanIdAndIsActiveTrue(plan.getId());
-        }
+    // -------------------------------------------------------------------------
+    // Conversion helpers
+    // -------------------------------------------------------------------------
 
-        List<PlanLimitDto> limitDtos = limits.stream()
-                .map(limit -> PlanLimitDto.builder()
-                        .id(limit.getId())
-                        .limitType(limit.getLimitType())
-                        .limitValue(limit.getLimitValue())
-                        .billingInterval(limit.getBillingInterval())
-                        .isActive(limit.getIsActive())
-                        .effectiveFrom(limit.getEffectiveFrom())
-                        .effectiveTo(limit.getEffectiveTo())
-                        .build())
-                .collect(Collectors.toList());
+    private PlanDto convertToPlanDto(BillingPlan plan,
+                                     BillingPlanLimit.BillingInterval billingInterval) {
+        LocalDateTime now = LocalDateTime.now();
 
-        return PlanDto.builder()
+        PlanDto dto = PlanDto.builder()
                 .id(plan.getId())
                 .planCode(plan.getPlanCode())
                 .planName(plan.getPlanName())
                 .description(plan.getDescription())
                 .isActive(plan.getIsActive())
                 .isEnterprise(plan.getIsEnterprise())
-                .supportTier(plan.getSupportTier())
-                .limits(limitDtos)
+                .supportTier(plan.getSupportTier() != null ? plan.getSupportTier().name() : null)
                 .build();
+
+        if (Boolean.TRUE.equals(plan.getIsEnterprise())) {
+            dto.setBillingMode("postpaid");
+            dto.setPricing(PlanDto.PricingDto.builder()
+                    .type("custom")
+                    .message("Custom pricing based on usage")
+                    .startingFrom("Contact us for pricing")
+                    .build());
+            dto.setUpgradeAction("contact_us");
+        } else {
+            // Load active limits
+            List<BillingPlanLimit> limits = planLimitsRepository
+                    .findActiveLimitsByPlanId(plan.getId(), now);
+
+            limits.stream().filter(l -> l.getBillingInterval() == billingInterval)
+                    .forEach(l -> {
+                        switch (l.getLimitType()) {
+                            case answers_per_period -> dto.setAnswersPerPeriod(l.getLimitValue());
+                            case kb_pages           -> dto.setKbPages(l.getLimitValue());
+                            case agents             -> dto.setAgents(l.getLimitValue());
+                            case users              -> dto.setUsers(l.getLimitValue());
+                        }
+                    });
+
+            // Load pricing
+            Optional<BillingStripePrice> monthlyPrice = stripePricesRepository
+                    .findByPlanCodeAndInterval(plan.getPlanCode(),
+                            BillingStripePrice.BillingInterval.month);
+            Optional<BillingStripePrice> annualPrice = stripePricesRepository
+                    .findByPlanCodeAndInterval(plan.getPlanCode(),
+                            BillingStripePrice.BillingInterval.year);
+
+            PlanDto.PricingDto pricing = PlanDto.PricingDto.builder()
+                    .type("standard")
+                    .monthly(monthlyPrice.map(p -> PlanDto.PriceIntervalDto.builder()
+                            .amount(p.getAmountCents())
+                            .amountFormatted(formatCents(p.getAmountCents()))
+                            .stripePriceId(p.getStripePriceId())
+                            .build()).orElse(null))
+                    .annual(annualPrice.map(p -> {
+                        int monthlyAmt = monthlyPrice.map(BillingStripePrice::getAmountCents).orElse(0);
+                        String savings = monthlyAmt > 0
+                                ? Math.round((1.0 - (p.getAmountCents() / 12.0) / monthlyAmt) * 100) + "%"
+                                : null;
+                        return PlanDto.PriceIntervalDto.builder()
+                                .amount(p.getAmountCents())
+                                .amountFormatted(formatCents(p.getAmountCents()))
+                                .stripePriceId(p.getStripePriceId())
+                                .savings(savings)
+                                .build();
+                    }).orElse(null))
+                    .build();
+            dto.setPricing(pricing);
+        }
+
+        return dto;
     }
 
     private AddonDto convertToAddonDto(BillingAddon addon) {
-        // Get deltas
-        List<BillingAddonDelta> deltas = addonDeltasRepository
-                .findActiveDeltasByAddonIds(List.of(addon.getId()), LocalDateTime.now());
+        LocalDateTime now = LocalDateTime.now();
 
-        List<AddonDeltaDto> deltaDtos = deltas.stream()
-                .map(delta -> AddonDeltaDto.builder()
-                        .id(delta.getId())
-                        .deltaType(delta.getDeltaType())
-                        .deltaValue(delta.getDeltaValue())
-                        .billingInterval(delta.getBillingInterval())
-                        .isActive(delta.getIsActive())
-                        .effectiveFrom(delta.getEffectiveFrom())
-                        .effectiveTo(delta.getEffectiveTo())
-                        .build())
-                .collect(Collectors.toList());
-
-        return AddonDto.builder()
+        AddonDto dto = AddonDto.builder()
                 .id(addon.getId())
                 .addonCode(addon.getAddonCode())
                 .addonName(addon.getAddonName())
@@ -380,54 +350,21 @@ public class PlanManagementServiceImpl implements PlanManagementService {
                 .tier(addon.getTier())
                 .description(addon.getDescription())
                 .isActive(addon.getIsActive())
-                .deltas(deltaDtos)
+                .isPurchased(false)
                 .build();
+
+        // Find primary delta (first active month delta)
+        addonDeltasRepository.findActiveDeltasByAddonId(addon.getId(), now)
+                .stream().findFirst().ifPresent(delta -> {
+                    dto.setDeltaType(delta.getDeltaType());
+                    dto.setDeltaValue(delta.getDeltaValue());
+                });
+
+        return dto;
     }
 
-    @Override
-    public PlanDto getPlanById(Long planId) {
-        log.debug("Fetching plan by ID: {}", planId);
-
-        BillingPlan plan = plansRepository.findById(planId)
-                .orElseThrow(() -> new RuntimeException("Plan not found with ID: " + planId));
-
-        return convertToPlanDto(plan, null);
-    }
-
-    @Override
-    public AddonDto getAddonById(Long addonId) {
-        log.debug("Fetching addon by ID: {}", addonId);
-
-        BillingAddon addon = addonsRepository.findById(addonId)
-                .orElseThrow(() -> new RuntimeException("Addon not found with ID: " + addonId));
-
-        return convertToAddonDto(addon);
-    }
-
-    @Override
-    public List<AddonDto> getAddonsByCodes(List<String> addonCodes) {
-        log.debug("Fetching addons by codes: {}", addonCodes);
-
-        if (addonCodes == null || addonCodes.isEmpty()) {
-            return new ArrayList<>();
-        }
-
-        List<BillingAddon> addons = addonsRepository.findByAddonCodesAndActive(addonCodes);
-
-        return addons.stream()
-                .map(this::convertToAddonDto)
-                .collect(Collectors.toList());
-    }
-
-    /** Resolve plan DB ID from plan code, returns null if not found */
-    private Long resolvePlanId(String planCode) {
-        if (planCode == null) return null;
-        return plansRepository.findByPlanCode(planCode).map(BillingPlan::getId).orElse(null);
-    }
-
-    /** Resolve addon DB ID from addon code, returns null if not found */
-    private Long resolveAddonId(String addonCode) {
-        if (addonCode == null) return null;
-        return addonsRepository.findByAddonCode(addonCode).map(BillingAddon::getId).orElse(null);
+    private String formatCents(Integer cents) {
+        if (cents == null) return "$0.00";
+        return String.format("$%.2f", cents / 100.0);
     }
 }

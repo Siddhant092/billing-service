@@ -1,31 +1,29 @@
 package com.broadnet.billing.dto;
 
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Pattern;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * Request DTO for creating a Stripe checkout session
+ * Request body for POST /api/billing/checkout/create-session
+ * Architecture Plan §1 Checkout API.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class CheckoutSessionRequest {
-    
-    @NotBlank(message = "Plan code is required")
+
+    /** Plan code to subscribe to (e.g. "professional"). */
     private String planCode;
-    
-    @NotBlank(message = "Billing interval is required")
-    @Pattern(regexp = "^(month|year)$", message = "Billing interval must be 'month' or 'year'")
+
+    /** Billing interval ("month" or "year"). */
     private String billingInterval;
-    
-    @NotBlank(message = "Success URL is required")
+
+    /** URL to redirect to after successful checkout. */
     private String successUrl;
-    
-    @NotBlank(message = "Cancel URL is required")
+
+    /** URL to redirect to if user cancels checkout. */
     private String cancelUrl;
 }

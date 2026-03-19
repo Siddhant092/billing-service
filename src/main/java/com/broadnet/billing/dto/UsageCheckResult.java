@@ -6,18 +6,30 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * Result DTO for usage limit checks
+ * Result of a non-incrementing limit check.
+ * Returned by UsageEnforcementService.check*Limit() methods.
+ *
+ * Architecture Plan API response:
+ * { allowed, kb_pages_total, kb_pages_limit, remaining }
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class UsageCheckResult {
-    
+
+    /** True if the action is allowed within current limits. */
     private boolean allowed;
-    private Integer currentUsage;
+
+    /** Current usage count for this metric. */
+    private Integer used;
+
+    /** Effective limit for this metric. */
     private Integer limit;
+
+    /** Remaining capacity (limit - used). */
     private Integer remaining;
-    private String message;
-    private String usageType; // answers, kb_pages, agents, users
+
+    /** Percentage used (0.0–100.0). */
+    private Double percentageUsed;
 }

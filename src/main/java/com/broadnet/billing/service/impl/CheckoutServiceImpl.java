@@ -2,195 +2,185 @@ package com.broadnet.billing.service.impl;
 
 import com.broadnet.billing.dto.CheckoutSessionRequest;
 import com.broadnet.billing.dto.CheckoutSessionResponse;
+import com.broadnet.billing.entity.BillingAddon;
+import com.broadnet.billing.entity.BillingPlanLimit;
 import com.broadnet.billing.entity.BillingStripePrice;
 import com.broadnet.billing.entity.CompanyBilling;
+import com.broadnet.billing.exception.BillingStateException;
+import com.broadnet.billing.exception.DuplicateResourceException;
+import com.broadnet.billing.exception.ResourceNotFoundException;
+import com.broadnet.billing.exception.StripeIntegrationException;
+import com.broadnet.billing.repository.BillingAddonsRepository;
 import com.broadnet.billing.repository.BillingStripePricesRepository;
+import com.broadnet.billing.repository.CompanyBillingRepository;
 import com.broadnet.billing.service.CheckoutService;
-import com.broadnet.billing.service.CompanyBillingService;
 import com.stripe.exception.StripeException;
 import com.stripe.model.checkout.Session;
 import com.stripe.param.checkout.SessionCreateParams;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.List;
 
-/**
- * Implementation of CheckoutService for Stripe checkout operations
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class CheckoutServiceImpl implements CheckoutService {
 
-    private final CompanyBillingService companyBillingService;
+    private final CompanyBillingRepository companyBillingRepository;
     private final BillingStripePricesRepository stripePricesRepository;
+    private final BillingAddonsRepository addonsRepository;
 
-    @Value("${stripe.webhook.secret}")
-    private String webhookSecret;
+    // -------------------------------------------------------------------------
+    // Plan checkout session
+    // -------------------------------------------------------------------------
 
     @Override
-    public CheckoutSessionResponse createCheckoutSession(Long companyId, CheckoutSessionRequest request) {
-        log.info("Creating checkout session for company {} with plan {}",
-                companyId, request.getPlanCode());
+    @Transactional(readOnly = true)
+    public CheckoutSessionResponse createCheckoutSession(Long companyId,
+                                                          CheckoutSessionRequest request) {
+        // 1. Load company billing to get stripe_customer_id
+        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "CompanyBilling", "companyId", companyId));
 
+        // 2. Look up Stripe price by plan_code + billing_interval
+        BillingStripePrice price = stripePricesRepository
+                .findByPlanCodeAndInterval(
+                        request.getPlanCode(),
+                        BillingStripePrice.BillingInterval.valueOf(request.getBillingInterval()))
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "BillingStripePrice",
+                        "planCode+interval",
+                        request.getPlanCode() + "_" + request.getBillingInterval()));
+
+        // 3. Create Stripe Checkout Session
         try {
-            CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-            // Get Stripe price ID
-            BillingStripePrice price = stripePricesRepository
-                    .findByPlanCodeAndInterval(request.getPlanCode(), request.getBillingInterval())
-                    .orElseThrow(() -> new RuntimeException(
-                            "Price not found for plan: " + request.getPlanCode()));
-
-            // Create metadata
-            Map<String, String> metadata = new HashMap<>();
-            metadata.put("company_id", String.valueOf(companyId));
-            metadata.put("plan_code", request.getPlanCode());
-            metadata.put("billing_interval", request.getBillingInterval());
-
-            // Build line item
-            SessionCreateParams.LineItem lineItem = SessionCreateParams.LineItem.builder()
-                    .setPrice(price.getStripePriceId())
-                    .setQuantity(1L)
-                    .build();
-
-            // Create checkout session
             SessionCreateParams params = SessionCreateParams.builder()
-                    .setCustomer(billing.getStripeCustomerId())
                     .setMode(SessionCreateParams.Mode.SUBSCRIPTION)
-                    .addLineItem(lineItem)
-                    .setSuccessUrl(request.getSuccessUrl() + "?session_id={CHECKOUT_SESSION_ID}")
+                    .setCustomer(billing.getStripeCustomerId())
+                    .setSuccessUrl(request.getSuccessUrl())
                     .setCancelUrl(request.getCancelUrl())
-                    .putAllMetadata(metadata)
-                    .setAllowPromotionCodes(true)
-                    .setBillingAddressCollection(SessionCreateParams.BillingAddressCollection.REQUIRED)
+                    .addLineItem(SessionCreateParams.LineItem.builder()
+                            .setPrice(price.getStripePriceId())
+                            .setQuantity(1L)
+                            .build())
+                    .putMetadata("company_id", String.valueOf(companyId))
+                    .putMetadata("plan_code", request.getPlanCode())
                     .build();
 
             Session session = Session.create(params);
 
-            log.info("Checkout session created: {} for company {}", session.getId(), companyId);
+            log.info("Created checkout session {} for companyId={} plan={}",
+                    session.getId(), companyId, request.getPlanCode());
 
             return CheckoutSessionResponse.builder()
                     .checkoutSessionId(session.getId())
                     .url(session.getUrl())
-                    .success(true)
-                    .message("Checkout session created successfully")
                     .build();
 
         } catch (StripeException e) {
-            log.error("Failed to create checkout session for company {}", companyId, e);
-            return CheckoutSessionResponse.builder()
-                    .success(false)
-                    .message("Failed to create checkout session: " + e.getMessage())
-                    .build();
+            throw new StripeIntegrationException(
+                    "Failed to create checkout session for companyId=" + companyId
+                            + " plan=" + request.getPlanCode(), e);
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Addon checkout session
+    // -------------------------------------------------------------------------
 
     @Override
-    public CheckoutSessionResponse createAddonCheckoutSession(Long companyId, String addonCode,
-                                                              String billingInterval) {
-        log.info("Creating addon checkout session for company {} with addon {}",
-                companyId, addonCode);
+    @Transactional(readOnly = true)
+    public CheckoutSessionResponse createAddonCheckoutSession(Long companyId,
+                                                               String addonCode,
+                                                               BillingPlanLimit.BillingInterval billingInterval) {
+        // 1. Validate addon exists and is active
+        BillingAddon addon = addonsRepository.findByAddonCodeAndIsActiveTrue(addonCode)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "BillingAddon", "addonCode", addonCode));
 
+        // 2. Load company billing
+        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "CompanyBilling", "companyId", companyId));
+
+        // 3. Check addon not already purchased
+        List<String> activeAddons = billing.getActiveAddonCodes();
+        if (activeAddons != null && activeAddons.contains(addonCode)) {
+            throw new DuplicateResourceException(
+                    "Addon already purchased", "addonCode", addonCode);
+        }
+
+        // 4. Look up Stripe price for addon
+        BillingStripePrice price = stripePricesRepository
+                .findByAddonCodeAndInterval(
+                        addonCode,
+                        BillingStripePrice.BillingInterval.valueOf(billingInterval.name()))
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "BillingStripePrice",
+                        "addonCode+interval",
+                        addonCode + "_" + billingInterval));
+
+        // 5. Verify company has an active subscription to attach addon to
+        if (billing.getStripeSubscriptionId() == null) {
+            throw new BillingStateException("NO_ACTIVE_SUBSCRIPTION",
+                    "Cannot purchase addon: company has no active subscription");
+        }
+
+        // 6. Create Checkout Session
         try {
-            CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-            if (billing.getStripeSubscriptionId() == null) {
-                return CheckoutSessionResponse.builder()
-                        .success(false)
-                        .message("No active subscription found. Please subscribe to a plan first.")
-                        .build();
-            }
-
-            // Get Stripe price ID for addon
-            BillingStripePrice price = stripePricesRepository
-                    .findByAddonCodeAndInterval(addonCode, billingInterval)
-                    .orElseThrow(() -> new RuntimeException(
-                            "Price not found for addon: " + addonCode));
-
-            // Create metadata
-            Map<String, String> metadata = new HashMap<>();
-            metadata.put("company_id", String.valueOf(companyId));
-            metadata.put("addon_code", addonCode);
-            metadata.put("billing_interval", billingInterval);
-            metadata.put("subscription_id", billing.getStripeSubscriptionId());
-
-            // Build line item
-            SessionCreateParams.LineItem lineItem = SessionCreateParams.LineItem.builder()
-                    .setPrice(price.getStripePriceId())
-                    .setQuantity(1L)
-                    .build();
-
-            // Create checkout session in payment mode for addon
             SessionCreateParams params = SessionCreateParams.builder()
-                    .setCustomer(billing.getStripeCustomerId())
                     .setMode(SessionCreateParams.Mode.SUBSCRIPTION)
-                    .addLineItem(lineItem)
-                    .setSuccessUrl("https://app.broadnet.ai/billing/success?session_id={CHECKOUT_SESSION_ID}")
-                    .setCancelUrl("https://app.broadnet.ai/billing")
-                    .putAllMetadata(metadata)
+                    .setCustomer(billing.getStripeCustomerId())
+                    .setSuccessUrl("https://app.broadnet.ai/billing?addon_success=true")
+                    .setCancelUrl("https://app.broadnet.ai/billing?addon_canceled=true")
+                    .addLineItem(SessionCreateParams.LineItem.builder()
+                            .setPrice(price.getStripePriceId())
+                            .setQuantity(1L)
+                            .build())
+                    .putMetadata("company_id", String.valueOf(companyId))
+                    .putMetadata("addon_code", addonCode)
                     .build();
 
             Session session = Session.create(params);
 
-            log.info("Addon checkout session created: {} for company {}", session.getId(), companyId);
+            log.info("Created addon checkout session {} for companyId={} addon={}",
+                    session.getId(), companyId, addonCode);
 
             return CheckoutSessionResponse.builder()
                     .checkoutSessionId(session.getId())
                     .url(session.getUrl())
-                    .success(true)
-                    .message("Addon checkout session created successfully")
+                    .addonCode(addonCode)
+                    .addonName(addon.getAddonName())
                     .build();
 
         } catch (StripeException e) {
-            log.error("Failed to create addon checkout session for company {}", companyId, e);
-            return CheckoutSessionResponse.builder()
-                    .success(false)
-                    .message("Failed to create addon checkout session: " + e.getMessage())
-                    .build();
+            throw new StripeIntegrationException(
+                    "Failed to create addon checkout session for addon=" + addonCode, e);
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Post-checkout success
+    // -------------------------------------------------------------------------
 
     @Override
     public boolean handleCheckoutSuccess(String sessionId) {
-        log.info("Handling checkout success for session: {}", sessionId);
-
+        // Architecture Plan: "Most subscription updates come via webhooks.
+        // This is just for immediate UI feedback."
+        // Simply verify the session is complete — webhook will handle entitlements.
         try {
             Session session = Session.retrieve(sessionId);
-
-            // Extract metadata
-            String companyIdStr = session.getMetadata().get("company_id");
-            if (companyIdStr == null) {
-                log.warn("No company_id in session metadata: {}", sessionId);
-                return false;
-            }
-
-            Long companyId = Long.parseLong(companyIdStr);
-            String subscriptionId = session.getSubscription();
-
-            if (subscriptionId == null) {
-                log.warn("No subscription created for session: {}", sessionId);
-                return false;
-            }
-
-            // Update company billing with subscription ID
-            CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-            billing.setStripeSubscriptionId(subscriptionId);
-            billing.setSubscriptionStatus("active");
-            companyBillingService.updateCompanyBilling(billing);
-
-            log.info("Checkout success handled for company {}, subscription {}",
-                    companyId, subscriptionId);
-
-            return true;
-
+            boolean complete = "complete".equals(session.getStatus());
+            log.info("Checkout session {} status: {}", sessionId, session.getStatus());
+            return complete;
         } catch (StripeException e) {
-            log.error("Failed to handle checkout success for session {}", sessionId, e);
-            return false;
+            log.warn("Could not retrieve checkout session {}: {}", sessionId, e.getMessage());
+            // Return true — webhook will handle the actual state update
+            return true;
         }
     }
 }

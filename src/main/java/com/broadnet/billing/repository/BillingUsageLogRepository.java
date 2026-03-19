@@ -11,35 +11,52 @@ import org.springframework.stereotype.Repository;
 import java.time.LocalDateTime;
 import java.util.List;
 
+/**
+ * Repository for billing_usage_logs table.
+ * This is an INSERT-only audit table — no updates or deletes.
+ *
+ * CHANGES FROM ORIGINAL:
+ * - findByCompanyIdAndUsageType: usageType param changed to BillingUsageLog.UsageType enum
+ * - findByUsageTypeAndDateRange: usageType param changed to enum
+ * - countUsageByTypeInDateRange: JPQL groups by bul.usageType (enum) — correct as-is
+ * - findByCompanyIdAndUsageTypeOrderByCreatedAtDesc (derived): usageType param → enum
+ * - findByCompanyIdAndCreatedAtBetween (derived): confirmed correct
+ * - findByCompanyIdOrderByCreatedAtDesc (derived): confirmed correct
+ * - getUsageSummaryByCompanyId: confirmed correct
+ */
 @Repository
 public interface BillingUsageLogRepository extends JpaRepository<BillingUsageLog, Long> {
 
     /**
-     * Find all usage logs for a company
+     * Find all usage logs for a company — paginated, newest-first.
+     * Used by usage analytics dashboard API.
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.companyId = :companyId " +
             "ORDER BY bul.createdAt DESC")
     Page<BillingUsageLog> findByCompanyId(@Param("companyId") Long companyId, Pageable pageable);
 
     /**
-     * Find usage logs by company and type
+     * Find usage logs by company and type.
+     * FIXED: usageType param type changed to BillingUsageLog.UsageType enum.
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.companyId = :companyId " +
             "AND bul.usageType = :usageType ORDER BY bul.createdAt DESC")
     List<BillingUsageLog> findByCompanyIdAndUsageType(
             @Param("companyId") Long companyId,
-            @Param("usageType") String usageType
+            @Param("usageType") BillingUsageLog.UsageType usageType
     );
 
     /**
-     * Find blocked usage attempts for a company
+     * Find all blocked usage attempts for a company.
+     * Used to audit limit enforcement and diagnose customer complaints.
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.companyId = :companyId " +
             "AND bul.wasBlocked = true ORDER BY bul.createdAt DESC")
     List<BillingUsageLog> findBlockedUsageByCompanyId(@Param("companyId") Long companyId);
 
     /**
-     * Find usage logs in date range
+     * Find usage logs for a company in a date range.
+     * Used by usage analytics service for period-based reports.
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.companyId = :companyId " +
             "AND bul.createdAt BETWEEN :startDate AND :endDate ORDER BY bul.createdAt DESC")
@@ -50,7 +67,9 @@ public interface BillingUsageLogRepository extends JpaRepository<BillingUsageLog
     );
 
     /**
-     * Count usage by type for a company in a date range
+     * Aggregate usage count by type for a company in a date range.
+     * Returns List<Object[]> with [UsageType, Long sum].
+     * Used by analytics dashboard to show per-metric usage totals.
      */
     @Query("SELECT bul.usageType, SUM(bul.usageCount) FROM BillingUsageLog bul " +
             "WHERE bul.companyId = :companyId " +
@@ -63,7 +82,7 @@ public interface BillingUsageLogRepository extends JpaRepository<BillingUsageLog
     );
 
     /**
-     * Find recent usage logs (last N hours)
+     * Find recent usage logs for a company (e.g. last 24 hours).
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.companyId = :companyId " +
             "AND bul.createdAt >= :since ORDER BY bul.createdAt DESC")
@@ -73,32 +92,35 @@ public interface BillingUsageLogRepository extends JpaRepository<BillingUsageLog
     );
 
     /**
-     * Count blocked attempts by company
+     * Count total blocked attempts for a company (monitoring/alerting).
      */
     @Query("SELECT COUNT(bul) FROM BillingUsageLog bul WHERE bul.companyId = :companyId " +
             "AND bul.wasBlocked = true")
     Long countBlockedAttemptsByCompanyId(@Param("companyId") Long companyId);
 
     /**
-     * Find usage logs by usage type in date range (for analytics)
+     * Find usage logs by type and date range — across all companies.
+     * Used by platform-wide analytics.
+     * FIXED: usageType param → enum
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.usageType = :usageType " +
             "AND bul.createdAt BETWEEN :startDate AND :endDate ORDER BY bul.createdAt ASC")
     List<BillingUsageLog> findByUsageTypeAndDateRange(
-            @Param("usageType") String usageType,
+            @Param("usageType") BillingUsageLog.UsageType usageType,
             @Param("startDate") LocalDateTime startDate,
             @Param("endDate") LocalDateTime endDate
     );
 
     /**
-     * Get usage summary for a company
+     * Get overall usage summary for a company (all-time totals per type).
+     * Returns List<Object[]> with [UsageType, Long count, Long sum].
      */
     @Query("SELECT bul.usageType, COUNT(bul), SUM(bul.usageCount) FROM BillingUsageLog bul " +
             "WHERE bul.companyId = :companyId GROUP BY bul.usageType")
     List<Object[]> getUsageSummaryByCompanyId(@Param("companyId") Long companyId);
 
     /**
-     * Find all blocked usage attempts in date range (for monitoring)
+     * Find all blocked attempts platform-wide in a date range (ops monitoring).
      */
     @Query("SELECT bul FROM BillingUsageLog bul WHERE bul.wasBlocked = true " +
             "AND bul.createdAt BETWEEN :startDate AND :endDate ORDER BY bul.createdAt DESC")
@@ -107,12 +129,13 @@ public interface BillingUsageLogRepository extends JpaRepository<BillingUsageLog
             @Param("endDate") LocalDateTime endDate
     );
 
-    // ⚠️ ADDED MISSING METHODS - Required by UsageAnalyticsServiceImpl
+    // -------------------------------------------------------------------------
+    // Spring Data derived queries — required by UsageAnalyticsServiceImpl
+    // -------------------------------------------------------------------------
 
     /**
-     * Find usage logs by company ID and created at between dates
-     * Required by UsageAnalyticsServiceImpl.getUsageStats()
-     * Required by UsageAnalyticsServiceImpl.getDailyAnswerUsage()
+     * Find logs for a company within a date range — Spring Data derived query.
+     * Required by UsageAnalyticsServiceImpl.getUsageStats() and getDailyAnswerUsage().
      */
     List<BillingUsageLog> findByCompanyIdAndCreatedAtBetween(
             Long companyId,
@@ -121,18 +144,19 @@ public interface BillingUsageLogRepository extends JpaRepository<BillingUsageLog
     );
 
     /**
-     * Find usage logs by company ID and usage type with pagination
-     * Required by UsageAnalyticsServiceImpl.getUsageLogs()
+     * Find logs by company and type with pagination — newest-first.
+     * Required by UsageAnalyticsServiceImpl.getUsageLogs().
+     * FIXED: usageType param → BillingUsageLog.UsageType enum
      */
     Page<BillingUsageLog> findByCompanyIdAndUsageTypeOrderByCreatedAtDesc(
             Long companyId,
-            String usageType,
+            BillingUsageLog.UsageType usageType,
             Pageable pageable
     );
 
     /**
-     * Find usage logs by company ID with pagination
-     * Required by UsageAnalyticsServiceImpl.getUsageLogs()
+     * Find all logs for a company with pagination — newest-first.
+     * Required by UsageAnalyticsServiceImpl.getUsageLogs() (no type filter).
      */
     Page<BillingUsageLog> findByCompanyIdOrderByCreatedAtDesc(
             Long companyId,

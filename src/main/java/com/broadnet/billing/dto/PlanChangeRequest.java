@@ -1,27 +1,29 @@
 package com.broadnet.billing.dto;
 
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Pattern;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * Request DTO for changing subscription plan
+ * Request body for POST /api/billing/subscription/change-plan
+ * Architecture Plan §2.2
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class PlanChangeRequest {
-    
-    @NotBlank(message = "New plan code is required")
-    private String newPlanCode;
-    
-    @NotBlank(message = "Billing interval is required")
-    @Pattern(regexp = "^(month|year)$", message = "Billing interval must be 'month' or 'year'")
+
+    /** Target plan code (e.g. "business"). */
+    private String planCode;
+
+    /** Target billing interval ("month" or "year"). */
     private String billingInterval;
-    
-    private Boolean prorationBehavior; // true = prorate, false = no proration
+
+    /**
+     * Stripe proration behavior.
+     * "create_prorations" (default), "none", "always_invoice"
+     */
+    private String prorationBehavior;
 }

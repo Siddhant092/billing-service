@@ -2,11 +2,11 @@ package com.broadnet.billing.service.impl;
 
 import com.broadnet.billing.dto.UsageCheckResult;
 import com.broadnet.billing.dto.UsageIncrementResult;
-import com.broadnet.billing.entity.CompanyBilling;
 import com.broadnet.billing.entity.BillingUsageLog;
-import com.broadnet.billing.exception.UsageLimitExceededException;
-import com.broadnet.billing.repository.CompanyBillingRepository;
+import com.broadnet.billing.entity.CompanyBilling;
+import com.broadnet.billing.exception.ResourceNotFoundException;
 import com.broadnet.billing.repository.BillingUsageLogRepository;
+import com.broadnet.billing.repository.CompanyBillingRepository;
 import com.broadnet.billing.service.UsageEnforcementService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,12 +14,16 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Implementation of UsageEnforcementService
- * Handles atomic usage increments with row-level locking
+ * Implements prepaid usage enforcement with row-level locking.
+ *
+ * Architecture Plan locking strategy:
+ * - Answers: atomic UPDATE with version+limit check (optimistic-style in one SQL)
+ * - KB/Agents/Users: SELECT FOR UPDATE then UPDATE (pessimistic lock)
+ * Enterprise customers route through BillingEnterpriseUsageService — this class
+ * only handles prepaid (blocking) enforcement.
  */
 @Slf4j
 @Service
@@ -27,162 +31,174 @@ import java.util.Map;
 public class UsageEnforcementServiceImpl implements UsageEnforcementService {
 
     private final CompanyBillingRepository companyBillingRepository;
-    private final BillingUsageLogRepository billingUsageLogRepository;
+    private final BillingUsageLogRepository usageLogRepository;
+
+    // -------------------------------------------------------------------------
+    // Answers — atomic increment via versioned UPDATE
+    // -------------------------------------------------------------------------
 
     @Override
     @Transactional
     public UsageIncrementResult incrementAnswerUsage(Long companyId) {
-        log.debug("Incrementing answer usage for company: {}", companyId);
-
-        // SELECT FOR UPDATE - row-level lock
+        // Lock row first
         CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
-
-        Integer beforeCount = billing.getAnswersUsedInPeriod();
-        Integer limit = billing.getEffectiveAnswersLimit();
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
         // Check if already blocked
-        if (billing.getAnswersBlocked()) {
-            logUsage(companyId, "answer", 1, beforeCount, beforeCount, true, "Already blocked");
-
+        if (Boolean.TRUE.equals(billing.getAnswersBlocked())) {
+            logUsage(companyId, BillingUsageLog.UsageType.answer, 1,
+                    billing.getAnswersUsedInPeriod(), billing.getAnswersUsedInPeriod(),
+                    true, "ANSWER_LIMIT_EXCEEDED");
             return UsageIncrementResult.builder()
                     .success(false)
-                    .usageCount(beforeCount)
-                    .limit(limit)
+                    .used(billing.getAnswersUsedInPeriod())
+                    .limit(billing.getEffectiveAnswersLimit())
                     .remaining(0)
                     .blocked(true)
-                    .error("ANSWER_LIMIT_EXCEEDED")
-                    .message("Answer limit already exceeded. Please upgrade your plan.")
+                    .errorCode("ANSWER_LIMIT_EXCEEDED")
+                    .message("You've reached your answer limit. Upgrade plan or add a boost.")
                     .build();
         }
 
         // Check if at limit
-        if (beforeCount >= limit) {
+        if (billing.getAnswersUsedInPeriod() >= billing.getEffectiveAnswersLimit()) {
             // Set blocked flag
             billing.setAnswersBlocked(true);
             companyBillingRepository.save(billing);
 
-            logUsage(companyId, "answer", 1, beforeCount, beforeCount, true, "Limit exceeded");
+            logUsage(companyId, BillingUsageLog.UsageType.answer, 1,
+                    billing.getAnswersUsedInPeriod(), billing.getAnswersUsedInPeriod(),
+                    true, "ANSWER_LIMIT_EXCEEDED");
 
             return UsageIncrementResult.builder()
                     .success(false)
-                    .usageCount(beforeCount)
-                    .limit(limit)
+                    .used(billing.getAnswersUsedInPeriod())
+                    .limit(billing.getEffectiveAnswersLimit())
                     .remaining(0)
                     .blocked(true)
-                    .error("ANSWER_LIMIT_EXCEEDED")
-                    .message("You've reached your answer limit. Upgrade your plan or add a boost.")
+                    .errorCode("ANSWER_LIMIT_EXCEEDED")
+                    .message("You've reached your answer limit. Upgrade plan or add a boost.")
                     .build();
         }
 
-        // Increment usage
-        Integer newCount = beforeCount + 1;
-        billing.setAnswersUsedInPeriod(newCount);
+        // Attempt atomic increment via versioned UPDATE
+        int updated = companyBillingRepository.incrementAnswerUsage(
+                companyId, 1, billing.getVersion());
 
-        // Set blocked if now at limit
-        if (newCount >= limit) {
-            billing.setAnswersBlocked(true);
+        if (updated == 0) {
+            // Version conflict — caller should retry
+            log.warn("Version conflict on answer increment for companyId={}", companyId);
+            return UsageIncrementResult.builder()
+                    .success(false)
+                    .errorCode("CONCURRENT_UPDATE")
+                    .message("Concurrent update, please retry.")
+                    .build();
         }
 
-        companyBillingRepository.save(billing);
+        // Refresh to get updated counts
+        CompanyBilling updated_ = companyBillingRepository.findByCompanyId(companyId)
+                .orElseThrow();
 
-        // Log usage
-        logUsage(companyId, "answer", 1, beforeCount, newCount, false, null);
+        int newCount  = updated_.getAnswersUsedInPeriod();
+        int limit     = updated_.getEffectiveAnswersLimit();
+        int remaining = Math.max(0, limit - newCount);
+        boolean nowBlocked = newCount >= limit;
+
+        logUsage(companyId, BillingUsageLog.UsageType.answer, 1,
+                newCount - 1, newCount, false, null);
+
+        log.debug("Answer incremented for companyId={}: {}/{}", companyId, newCount, limit);
 
         return UsageIncrementResult.builder()
                 .success(true)
-                .usageCount(newCount)
+                .used(newCount)
                 .limit(limit)
-                .remaining(limit - newCount)
-                .blocked(newCount >= limit)
-                .message("Answer usage incremented successfully")
+                .remaining(remaining)
+                .blocked(nowBlocked)
                 .build();
     }
 
+    // -------------------------------------------------------------------------
+    // KB Pages — pessimistic lock
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
     public UsageCheckResult checkKbPageLimit(Long companyId) {
         CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        Integer current = billing.getKbPagesTotal();
-        Integer limit = billing.getEffectiveKbPagesLimit();
-        boolean allowed = current < limit;
+        int used      = billing.getKbPagesTotal();
+        int limit     = billing.getEffectiveKbPagesLimit();
+        int remaining = Math.max(0, limit - used);
+        double pct    = limit > 0 ? (used * 100.0 / limit) : 0.0;
 
         return UsageCheckResult.builder()
-                .allowed(allowed)
-                .currentUsage(current)
+                .allowed(used < limit)
+                .used(used)
                 .limit(limit)
-                .remaining(allowed ? limit - current : 0)
-                .usageType("kb_pages")
-                .message(allowed ? "KB page creation allowed" : "KB page limit reached")
+                .remaining(remaining)
+                .percentageUsed(pct)
                 .build();
     }
 
     @Override
     @Transactional
     public UsageIncrementResult incrementKbPageUsage(Long companyId) {
-        log.debug("Incrementing KB page usage for company: {}", companyId);
-
         CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        Integer beforeCount = billing.getKbPagesTotal();
-        Integer limit = billing.getEffectiveKbPagesLimit();
+        int used  = billing.getKbPagesTotal();
+        int limit = billing.getEffectiveKbPagesLimit();
 
-        if (beforeCount >= limit) {
-            logUsage(companyId, "kb_page_added", 1, beforeCount, beforeCount, true, "Limit exceeded");
-
-            throw new UsageLimitExceededException(
-                    "KB page limit exceeded", "kb_pages", beforeCount, limit);
+        if (used >= limit) {
+            logUsage(companyId, BillingUsageLog.UsageType.kb_page_added, 1,
+                    used, used, true, "KB_PAGE_LIMIT_EXCEEDED");
+            return UsageIncrementResult.builder()
+                    .success(false)
+                    .used(used).limit(limit).remaining(0).blocked(true)
+                    .errorCode("KB_PAGE_LIMIT_EXCEEDED")
+                    .message("You've reached your KB pages limit.")
+                    .build();
         }
 
-        Integer newCount = beforeCount + 1;
-        billing.setKbPagesTotal(newCount);
+        billing.setKbPagesTotal(used + 1);
         companyBillingRepository.save(billing);
 
-        logUsage(companyId, "kb_page_added", 1, beforeCount, newCount, false, null);
+        logUsage(companyId, BillingUsageLog.UsageType.kb_page_added, 1, used, used + 1, false, null);
 
         return UsageIncrementResult.builder()
                 .success(true)
-                .usageCount(newCount)
-                .limit(limit)
-                .remaining(limit - newCount)
-                .blocked(false)
-                .message("KB page usage incremented successfully")
+                .used(used + 1).limit(limit).remaining(limit - used - 1).blocked(false)
                 .build();
     }
 
     @Override
     @Transactional
     public void decrementKbPageUsage(Long companyId) {
-        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+        CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        if (billing.getKbPagesTotal() > 0) {
-            billing.setKbPagesTotal(billing.getKbPagesTotal() - 1);
-            companyBillingRepository.save(billing);
-
-            logUsage(companyId, "kb_page_deleted", -1,
-                    billing.getKbPagesTotal() + 1, billing.getKbPagesTotal(), false, null);
-        }
+        int newCount = Math.max(0, billing.getKbPagesTotal() - 1);
+        billing.setKbPagesTotal(newCount);
+        companyBillingRepository.save(billing);
     }
 
+    // -------------------------------------------------------------------------
+    // Agents — pessimistic lock
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
     public UsageCheckResult checkAgentLimit(Long companyId) {
         CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        Integer current = billing.getAgentsTotal();
-        Integer limit = billing.getEffectiveAgentsLimit();
-        boolean allowed = current < limit;
-
+        int used = billing.getAgentsTotal(), limit = billing.getEffectiveAgentsLimit();
         return UsageCheckResult.builder()
-                .allowed(allowed)
-                .currentUsage(current)
-                .limit(limit)
-                .remaining(allowed ? limit - current : 0)
-                .usageType("agents")
-                .message(allowed ? "Agent creation allowed" : "Agent limit reached")
+                .allowed(used < limit).used(used).limit(limit)
+                .remaining(Math.max(0, limit - used))
+                .percentageUsed(limit > 0 ? (used * 100.0 / limit) : 0.0)
                 .build();
     }
 
@@ -190,58 +206,52 @@ public class UsageEnforcementServiceImpl implements UsageEnforcementService {
     @Transactional
     public UsageIncrementResult incrementAgentUsage(Long companyId) {
         CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        Integer beforeCount = billing.getAgentsTotal();
-        Integer limit = billing.getEffectiveAgentsLimit();
-
-        if (beforeCount >= limit) {
-            throw new UsageLimitExceededException(
-                    "Agent limit exceeded", "agents", beforeCount, limit);
+        int used = billing.getAgentsTotal(), limit = billing.getEffectiveAgentsLimit();
+        if (used >= limit) {
+            logUsage(companyId, BillingUsageLog.UsageType.agent_created, 1,
+                    used, used, true, "AGENT_LIMIT_EXCEEDED");
+            return UsageIncrementResult.builder()
+                    .success(false).used(used).limit(limit).remaining(0).blocked(true)
+                    .errorCode("AGENT_LIMIT_EXCEEDED")
+                    .message("You've reached your agent limit.")
+                    .build();
         }
 
-        Integer newCount = beforeCount + 1;
-        billing.setAgentsTotal(newCount);
+        billing.setAgentsTotal(used + 1);
         companyBillingRepository.save(billing);
-
-        logUsage(companyId, "agent_created", 1, beforeCount, newCount, false, null);
+        logUsage(companyId, BillingUsageLog.UsageType.agent_created, 1, used, used + 1, false, null);
 
         return UsageIncrementResult.builder()
-                .success(true)
-                .usageCount(newCount)
-                .limit(limit)
-                .remaining(limit - newCount)
+                .success(true).used(used + 1).limit(limit).remaining(limit - used - 1).blocked(false)
                 .build();
     }
 
     @Override
     @Transactional
     public void decrementAgentUsage(Long companyId) {
-        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
-
-        if (billing.getAgentsTotal() > 0) {
-            billing.setAgentsTotal(billing.getAgentsTotal() - 1);
-            companyBillingRepository.save(billing);
-        }
+        CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
+        billing.setAgentsTotal(Math.max(0, billing.getAgentsTotal() - 1));
+        companyBillingRepository.save(billing);
     }
 
+    // -------------------------------------------------------------------------
+    // Users — pessimistic lock
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
     public UsageCheckResult checkUserLimit(Long companyId) {
         CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        Integer current = billing.getUsersTotal();
-        Integer limit = billing.getEffectiveUsersLimit();
-        boolean allowed = current < limit;
-
+        int used = billing.getUsersTotal(), limit = billing.getEffectiveUsersLimit();
         return UsageCheckResult.builder()
-                .allowed(allowed)
-                .currentUsage(current)
-                .limit(limit)
-                .remaining(allowed ? limit - current : 0)
-                .usageType("users")
-                .message(allowed ? "User creation allowed" : "User limit reached")
+                .allowed(used < limit).used(used).limit(limit)
+                .remaining(Math.max(0, limit - used))
+                .percentageUsed(limit > 0 ? (used * 100.0 / limit) : 0.0)
                 .build();
     }
 
@@ -249,94 +259,89 @@ public class UsageEnforcementServiceImpl implements UsageEnforcementService {
     @Transactional
     public UsageIncrementResult incrementUserUsage(Long companyId) {
         CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
-        Integer beforeCount = billing.getUsersTotal();
-        Integer limit = billing.getEffectiveUsersLimit();
-
-        if (beforeCount >= limit) {
-            throw new UsageLimitExceededException(
-                    "User limit exceeded", "users", beforeCount, limit);
+        int used = billing.getUsersTotal(), limit = billing.getEffectiveUsersLimit();
+        if (used >= limit) {
+            logUsage(companyId, BillingUsageLog.UsageType.user_created, 1,
+                    used, used, true, "USER_LIMIT_EXCEEDED");
+            return UsageIncrementResult.builder()
+                    .success(false).used(used).limit(limit).remaining(0).blocked(true)
+                    .errorCode("USER_LIMIT_EXCEEDED")
+                    .message("You've reached your user limit.")
+                    .build();
         }
 
-        Integer newCount = beforeCount + 1;
-        billing.setUsersTotal(newCount);
+        billing.setUsersTotal(used + 1);
         companyBillingRepository.save(billing);
-
-        logUsage(companyId, "user_created", 1, beforeCount, newCount, false, null);
+        logUsage(companyId, BillingUsageLog.UsageType.user_created, 1, used, used + 1, false, null);
 
         return UsageIncrementResult.builder()
-                .success(true)
-                .usageCount(newCount)
-                .limit(limit)
-                .remaining(limit - newCount)
+                .success(true).used(used + 1).limit(limit).remaining(limit - used - 1).blocked(false)
                 .build();
     }
 
     @Override
     @Transactional
     public void decrementUserUsage(Long companyId) {
-        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
-
-        if (billing.getUsersTotal() > 0) {
-            billing.setUsersTotal(billing.getUsersTotal() - 1);
-            companyBillingRepository.save(billing);
-        }
+        CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
+        billing.setUsersTotal(Math.max(0, billing.getUsersTotal() - 1));
+        companyBillingRepository.save(billing);
     }
+
+    // -------------------------------------------------------------------------
+    // Admin operations
+    // -------------------------------------------------------------------------
 
     @Override
     @Transactional
     public void unblockAnswers(Long companyId, Long adminUserId) {
-        log.info("Unblocking answers for company {} by admin {}", companyId, adminUserId);
-
-        CompanyBilling billing = companyBillingRepository.findByCompanyId(companyId)
-                .orElseThrow(() -> new RuntimeException("Company billing not found"));
+        CompanyBilling billing = companyBillingRepository.findByCompanyIdWithLock(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException("CompanyBilling", "companyId", companyId));
 
         billing.setAnswersBlocked(false);
         companyBillingRepository.save(billing);
 
-        Map<String, Object> metadata = new HashMap<>();
-        metadata.put("admin_user_id", adminUserId);
-        metadata.put("action", "manual_unblock");
-
-        logUsageWithMetadata(companyId, "answer", 0,
-                billing.getAnswersUsedInPeriod(), billing.getAnswersUsedInPeriod(),
-                false, "Manually unblocked by admin", metadata);
+        // Log the manual unblock
+        BillingUsageLog log_ = BillingUsageLog.builder()
+                .companyId(companyId)
+                .usageType(BillingUsageLog.UsageType.answer)
+                .usageCount(0)
+                .wasBlocked(false)
+                .metadata(Map.of("action", "manual_unblock", "adminUserId", adminUserId))
+                .build();
+        usageLogRepository.save(log_);
+        log.info("Answers unblocked for companyId={} by adminUserId={}", companyId, adminUserId);
     }
 
     @Override
     @Transactional
     public void resetPeriodUsage(Long companyId) {
-        log.info("Resetting period usage for company: {}", companyId);
-
         companyBillingRepository.resetPeriodUsage(companyId, LocalDateTime.now());
-
-        logUsage(companyId, "answer", 0, null, 0, false, "Period reset");
+        log.info("Period usage reset for companyId={}", companyId);
     }
 
-    private void logUsage(Long companyId, String usageType, Integer count,
-                          Integer beforeCount, Integer afterCount,
-                          Boolean wasBlocked, String blockReason) {
-        logUsageWithMetadata(companyId, usageType, count, beforeCount, afterCount,
-                wasBlocked, blockReason, null);
-    }
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
 
-    private void logUsageWithMetadata(Long companyId, String usageType, Integer count,
-                                      Integer beforeCount, Integer afterCount,
-                                      Boolean wasBlocked, String blockReason,
-                                      Map<String, Object> metadata) {
-        BillingUsageLog log = BillingUsageLog.builder()
-                .companyId(companyId)
-                .usageType(usageType)
-                .usageCount(count)
-                .beforeCount(beforeCount)
-                .afterCount(afterCount)
-                .wasBlocked(wasBlocked)
-                .blockReason(blockReason)
-                .metadata(metadata)
-                .build();
-
-        billingUsageLogRepository.save(log);
+    private void logUsage(Long companyId, BillingUsageLog.UsageType type, int count,
+                          Integer before, Integer after, boolean wasBlocked, String blockReason) {
+        try {
+            BillingUsageLog entry = BillingUsageLog.builder()
+                    .companyId(companyId)
+                    .usageType(type)
+                    .usageCount(count)
+                    .beforeCount(before)
+                    .afterCount(after)
+                    .wasBlocked(wasBlocked)
+                    .blockReason(blockReason)
+                    .build();
+            usageLogRepository.save(entry);
+        } catch (Exception e) {
+            // Usage logging must never break the main flow
+            log.error("Failed to log usage for companyId={}, type={}: {}", companyId, type, e.getMessage());
+        }
     }
 }

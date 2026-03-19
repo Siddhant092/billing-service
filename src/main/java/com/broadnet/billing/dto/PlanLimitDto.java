@@ -1,26 +1,29 @@
 package com.broadnet.billing.dto;
 
+import com.broadnet.billing.entity.BillingPlanLimit;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-
 import java.time.LocalDateTime;
 
 /**
- * DTO for plan limit details
+ * Request DTO for updating a plan limit.
+ * Architecture Plan: PUT /api/admin/billing/plans/{plan_code}/limits
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class PlanLimitDto {
-    
-    private Long id;
-    private String limitType; // answers_per_period, kb_pages, agents, users
+
+    private BillingPlanLimit.LimitType limitType;
     private Integer limitValue;
-    private String billingInterval; // month, year
-    private Boolean isActive;
+    private BillingPlanLimit.BillingInterval billingInterval;
+
+    /**
+     * When the new limit takes effect.
+     * Architecture Plan: "effective_from" — enables scheduled limit changes.
+     */
     private LocalDateTime effectiveFrom;
-    private LocalDateTime effectiveTo;
 }

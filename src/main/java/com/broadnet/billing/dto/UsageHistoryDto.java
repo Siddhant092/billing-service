@@ -4,25 +4,30 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-
-import java.time.LocalDate;
 import java.util.Map;
 
 /**
- * DTO for usage history with daily breakdown
+ * Usage history for charts.
+ * Architecture Plan §4 Usage Analytics.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class UsageHistoryDto {
-    
-    private Map<LocalDate, Integer> dailyAnswerCounts;
-    private Map<LocalDate, Integer> dailyKbPageChanges;
-    
+
+    /** Map of date string (yyyy-MM-dd) to answer count. */
+    private Map<String, Integer> dailyAnswers;
+
+    /** Map of date string to KB pages added. */
+    private Map<String, Integer> dailyKbPages;
+
+    /** Number of days this history covers. */
+    private Integer days;
+
+    /** Total answers in period. */
     private Integer totalAnswers;
-    private Integer totalKbPages;
-    
-    private Double averageAnswersPerDay;
-    private String trend; // increasing, decreasing, stable
+
+    /** Total KB pages added in period. */
+    private Integer totalKbPagesAdded;
 }

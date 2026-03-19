@@ -4,45 +4,38 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-
 import java.time.LocalDateTime;
 
 /**
- * DTO for usage metrics
+ * Usage metrics for current billing period.
+ * Architecture Plan §1.4 GET /api/billing/usage-metrics.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class UsageMetricsDto {
-    
-    // Answers
-    private Integer answersUsed;
-    private Integer answersLimit;
-    private Integer answersRemaining;
-    private Double answersPercentageUsed;
-    private Boolean answersBlocked;
-    
-    // KB Pages
-    private Integer kbPagesTotal;
-    private Integer kbPagesLimit;
-    private Integer kbPagesRemaining;
-    private Double kbPagesPercentageUsed;
-    
-    // Agents
-    private Integer agentsTotal;
-    private Integer agentsLimit;
-    private Integer agentsRemaining;
-    private Double agentsPercentageUsed;
-    
-    // Users
-    private Integer usersTotal;
-    private Integer usersLimit;
-    private Integer usersRemaining;
-    private Double usersPercentageUsed;
-    
-    // Period Info
-    private LocalDateTime periodStart;
-    private LocalDateTime periodEnd;
-    private Integer daysUntilReset;
+
+    private MetricDto answers;
+    private MetricDto kbPages;
+    private MetricDto agents;
+    private MetricDto users;
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class MetricDto {
+        private Integer used;
+        private Integer limit;
+        private Integer remaining;
+        private Double percentage;
+        private Boolean isBlocked;
+
+        /**
+         * When this metric resets to zero.
+         * Non-null for answers (periodic), null for kb_pages/agents/users (cumulative).
+         */
+        private LocalDateTime resetDate;
+    }
 }

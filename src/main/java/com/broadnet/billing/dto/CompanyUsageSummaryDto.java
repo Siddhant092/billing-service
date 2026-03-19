@@ -1,45 +1,52 @@
 package com.broadnet.billing.dto;
 
+import com.broadnet.billing.entity.CompanyBilling;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * DTO for company usage summary (Admin view)
+ * Per-company usage summary for admin dashboard.
+ * Returned by UsageAnalyticsService.getCompanyUsageSummary() and getCompaniesApproachingLimits().
+ *
+ * Architecture Plan: GET /api/admin/billing/usage-summary
+ * Shows: company, current plan, usage vs limits, status.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class CompanyUsageSummaryDto {
-    
+
     private Long companyId;
-    private String companyName;
-    private String planCode;
-    private String planName;
-    private String subscriptionStatus;
-    
-    // Usage vs Limits
+    private CompanyBilling.SubscriptionStatus subscriptionStatus;
+    private String activePlanCode;
+    private CompanyBilling.BillingMode billingMode;
+
+    /** Answer usage. */
     private Integer answersUsed;
     private Integer answersLimit;
     private Double answersPercentage;
-    
-    private Integer kbPagesUsed;
+    private Boolean answersBlocked;
+
+    /** KB pages. */
+    private Integer kbPagesTotal;
     private Integer kbPagesLimit;
     private Double kbPagesPercentage;
-    
-    private Integer agentsUsed;
+
+    /** Agents. */
+    private Integer agentsTotal;
     private Integer agentsLimit;
-    
-    private Integer usersUsed;
+    private Double agentsPercentage;
+
+    /** Users. */
+    private Integer usersTotal;
     private Integer usersLimit;
-    
-    // Status
-    private String status; // ok, warning, blocked
-    private Boolean answersBlocked;
-    
-    // Alerts
-    private Boolean approachingLimit; // >80% usage
-    private String alertMessage;
+    private Double usersPercentage;
+
+    /**
+     * Overall health status: "ok", "warning" (>80%), "blocked", "restricted".
+     */
+    private String status;
 }

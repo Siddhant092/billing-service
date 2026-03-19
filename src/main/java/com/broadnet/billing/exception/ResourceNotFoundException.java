@@ -1,16 +1,25 @@
 package com.broadnet.billing.exception;
 
-public class ResourceNotFoundException extends RuntimeException {
+/**
+ * Thrown when a requested resource does not exist.
+ * Maps to HTTP 404 Not Found.
+ *
+ * Referenced in service Javadocs (e.g. getActivePricing, getCompanyBilling).
+ *
+ * Usage:
+ *   throw new ResourceNotFoundException("CompanyBilling", "companyId", companyId);
+ *   throw new ResourceNotFoundException("BillingPlan", "planCode", "professional");
+ */
+public class ResourceNotFoundException extends BillingException {
+
+    private static final String ERROR_CODE = "RESOURCE_NOT_FOUND";
+
+    public ResourceNotFoundException(String resourceName, String fieldName, Object fieldValue) {
+        super(ERROR_CODE,
+              String.format("%s not found with %s: '%s'", resourceName, fieldName, fieldValue));
+    }
 
     public ResourceNotFoundException(String message) {
-        super(message);
-    }
-
-    public ResourceNotFoundException(String resourceType, Long id) {
-        super(String.format("%s not found with id: %d", resourceType, id));
-    }
-
-    public ResourceNotFoundException(String resourceType, String identifier) {
-        super(String.format("%s not found: %s", resourceType, identifier));
+        super(ERROR_CODE, message);
     }
 }

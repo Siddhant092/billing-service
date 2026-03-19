@@ -1,33 +1,31 @@
 package com.broadnet.billing.dto;
 
+import com.broadnet.billing.entity.BillingPaymentMethod;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * DTO for payment method details
+ * Payment method response DTO.
+ * Architecture Plan §1.3 billing-snapshot.paymentMethod.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
 public class PaymentMethodDto {
-    
+
     private Long id;
     private String stripePaymentMethodId;
-    private String type; // card, sepa_debit, etc.
+    private BillingPaymentMethod.PaymentMethodType type;
     private Boolean isDefault;
-    
-    // Card Details
-    private String cardBrand; // visa, mastercard, amex
+    private String cardBrand;
     private String cardLast4;
     private Integer cardExpMonth;
     private Integer cardExpYear;
     private Boolean isExpired;
-    private Boolean isExpiringSoon; // within 30 days
-    
-    // Billing Details
-    private String billingName;
-    private String billingEmail;
+
+    /** True if card expires within 30 days. */
+    private Boolean isExpiringSoon;
 }

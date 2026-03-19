@@ -1,421 +1,422 @@
 package com.broadnet.billing.service.impl;
 
 import com.broadnet.billing.dto.*;
-import com.broadnet.billing.entity.BillingEntitlementHistory;
-import com.broadnet.billing.entity.CompanyBilling;
-import com.broadnet.billing.repository.BillingEntitlementHistoryRepository;
-import com.broadnet.billing.service.BillingDashboardService;
-import com.broadnet.billing.service.CompanyBillingService;
-import com.broadnet.billing.service.EntitlementService;
+import com.broadnet.billing.entity.*;
+import com.broadnet.billing.exception.ResourceNotFoundException;
+import com.broadnet.billing.exception.StripeIntegrationException;
+import com.broadnet.billing.repository.*;
+import com.broadnet.billing.service.*;
 import com.stripe.exception.StripeException;
-import com.stripe.model.*;
-import com.stripe.param.InvoiceListParams;
-import com.stripe.param.PaymentMethodListParams;
+import com.stripe.model.Invoice;
+import com.stripe.param.InvoiceUpcomingParams;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
-import java.time.temporal.ChronoUnit;
-import java.util.*;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-/**
- * Implementation of BillingDashboardService
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class BillingDashboardServiceImpl implements BillingDashboardService {
 
-    private final CompanyBillingService companyBillingService;
-    private final EntitlementService entitlementService;
+    private final CompanyBillingRepository companyBillingRepository;
+    private final BillingPaymentMethodRepository paymentMethodRepository;
     private final BillingEntitlementHistoryRepository entitlementHistoryRepository;
+    private final BillingInvoiceService invoiceService;
+    private final BillingNotificationService notificationService;
+    private final PlanManagementService planManagementService;
+    private final SubscriptionManagementService subscriptionManagementService;
+    private final UsageAnalyticsService usageAnalyticsService;
+
+    // -------------------------------------------------------------------------
+    // §1.3 Billing Snapshot
+    // -------------------------------------------------------------------------
 
     @Override
+    @Transactional(readOnly = true)
     public BillingSnapshotDto getBillingSnapshot(Long companyId) {
-        log.info("Fetching billing snapshot for company: {}", companyId);
+        CompanyBilling billing = getBilling(companyId);
 
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
+        // 1. Latest invoice from local DB
+        InvoiceDto latestInvoice = invoiceService.getLatestInvoice(companyId);
 
-        // Get usage metrics
-        UsageMetricsDto usageMetrics = getUsageMetrics(companyId);
+        // 2. Upcoming invoice from Stripe API
+        UpcomingInvoiceDto upcoming = getUpcomingInvoice(companyId);
 
-        // Get payment method
-        PaymentMethodDto paymentMethod = getDefaultPaymentMethod(billing.getStripeCustomerId());
-
-        // Get upcoming invoice
-        UpcomingInvoiceDto upcomingInvoice = getUpcomingInvoice(billing.getStripeCustomerId());
-
-        // Build alerts
-        List<String> alerts = buildAlerts(billing, usageMetrics);
+        // 3. Default payment method
+        PaymentMethodDto paymentMethod = paymentMethodRepository
+                .findByCompanyIdAndIsDefaultTrue(companyId)
+                .map(this::toPaymentMethodDto)
+                .orElse(null);
 
         return BillingSnapshotDto.builder()
-                .planCode(billing.getActivePlanCode())
-                .subscriptionStatus(billing.getSubscriptionStatus())
-                .billingInterval(billing.getBillingInterval())
-                .renewalDate(billing.getPeriodEnd())
-                .cancelAtPeriodEnd(billing.getCancelAtPeriodEnd())
-                .usageMetrics(usageMetrics)
-                .defaultPaymentMethod(paymentMethod)
-                .upcomingInvoice(upcomingInvoice)
-                .activeAddonCodes(billing.getActiveAddonCodes())
-                .pendingPlanCode(billing.getPendingPlanCode())
-                .pendingEffectiveDate(billing.getPendingEffectiveDate())
-                .alerts(alerts)
-                .stripeCustomerId(billing.getStripeCustomerId())
-                .stripeSubscriptionId(billing.getStripeSubscriptionId())
+                .latestInvoice(latestInvoice)
+                .nextInvoice(upcoming)
+                .paymentMethod(paymentMethod)
                 .build();
     }
 
+    // -------------------------------------------------------------------------
+    // §1.4 Usage Metrics
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
     public UsageMetricsDto getUsageMetrics(Long companyId) {
-        log.debug("Fetching usage metrics for company: {}", companyId);
-
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-        long daysUntilReset = billing.getPeriodEnd() != null ?
-                ChronoUnit.DAYS.between(LocalDateTime.now(), billing.getPeriodEnd()) : 0;
+        CompanyBilling b = getBilling(companyId);
 
         return UsageMetricsDto.builder()
-                // Answers
-                .answersUsed(billing.getAnswersUsedInPeriod())
-                .answersLimit(billing.getEffectiveAnswersLimit())
-                .answersRemaining(Math.max(0, billing.getEffectiveAnswersLimit() -
-                        billing.getAnswersUsedInPeriod()))
-                .answersPercentageUsed(calculatePercentage(
-                        billing.getAnswersUsedInPeriod(), billing.getEffectiveAnswersLimit()))
-                .answersBlocked(billing.getAnswersBlocked())
-                // KB Pages
-                .kbPagesTotal(billing.getKbPagesTotal())
-                .kbPagesLimit(billing.getEffectiveKbPagesLimit())
-                .kbPagesRemaining(Math.max(0, billing.getEffectiveKbPagesLimit() -
-                        billing.getKbPagesTotal()))
-                .kbPagesPercentageUsed(calculatePercentage(
-                        billing.getKbPagesTotal(), billing.getEffectiveKbPagesLimit()))
-                // Agents
-                .agentsTotal(billing.getAgentsTotal())
-                .agentsLimit(billing.getEffectiveAgentsLimit())
-                .agentsRemaining(Math.max(0, billing.getEffectiveAgentsLimit() -
-                        billing.getAgentsTotal()))
-                .agentsPercentageUsed(calculatePercentage(
-                        billing.getAgentsTotal(), billing.getEffectiveAgentsLimit()))
-                // Users
-                .usersTotal(billing.getUsersTotal())
-                .usersLimit(billing.getEffectiveUsersLimit())
-                .usersRemaining(Math.max(0, billing.getEffectiveUsersLimit() -
-                        billing.getUsersTotal()))
-                .usersPercentageUsed(calculatePercentage(
-                        billing.getUsersTotal(), billing.getEffectiveUsersLimit()))
-                // Period Info
-                .periodStart(billing.getPeriodStart())
-                .periodEnd(billing.getPeriodEnd())
-                .daysUntilReset((int) daysUntilReset)
+                .answers(buildMetric(
+                        b.getAnswersUsedInPeriod(), b.getEffectiveAnswersLimit(),
+                        b.getAnswersBlocked(), b.getPeriodEnd()))
+                .kbPages(buildMetric(
+                        b.getKbPagesTotal(), b.getEffectiveKbPagesLimit(), false, null))
+                .agents(buildMetric(
+                        b.getAgentsTotal(), b.getEffectiveAgentsLimit(), false, null))
+                .users(buildMetric(
+                        b.getUsersTotal(), b.getEffectiveUsersLimit(), false, null))
                 .build();
     }
 
-    @Override
-    public CurrentPlanDto getCurrentPlan(Long companyId) {
-        log.debug("Fetching current plan for company: {}", companyId);
+    // -------------------------------------------------------------------------
+    // §1.2 Current Plan
+    // -------------------------------------------------------------------------
 
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
+    @Override
+    @Transactional(readOnly = true)
+    public CurrentPlanDto getCurrentPlan(Long companyId) {
+        CompanyBilling b = getBilling(companyId);
+
+        CurrentPlanDto.PendingChangeDto pendingChange = null;
+        if (b.getPendingPlanCode() != null) {
+            pendingChange = CurrentPlanDto.PendingChangeDto.builder()
+                    .pendingPlanCode(b.getPendingPlanCode())
+                    .effectiveDate(b.getPendingEffectiveDate())
+                    .build();
+        }
+
+        // Fetch plan name from plan catalog
+        String planName = null;
+        if (b.getActivePlanCode() != null) {
+            try {
+                planName = planManagementService.getPlanByCode(b.getActivePlanCode()).getPlanName();
+            } catch (ResourceNotFoundException e) {
+                log.warn("Plan {} not found for dashboard", b.getActivePlanCode());
+            }
+        }
 
         return CurrentPlanDto.builder()
-                .planCode(billing.getActivePlanCode())
-                .billingInterval(billing.getBillingInterval())
-                .renewalDate(billing.getPeriodEnd())
-                .cancelAtPeriodEnd(billing.getCancelAtPeriodEnd())
+                .planCode(b.getActivePlanCode())
+                .planName(planName)
+                .billingInterval(b.getBillingInterval())
+                .billingCycle(b.getBillingInterval() != null
+                        ? (b.getBillingInterval() == CompanyBilling.BillingInterval.month
+                           ? "Monthly" : "Annual") : null)
+                .renewalDate(b.getPeriodEnd())
+                .status(b.getSubscriptionStatus())
+                .cancelAtPeriodEnd(b.getCancelAtPeriodEnd())
+                .cancelAt(b.getCancelAt())
+                .periodStart(b.getPeriodStart())
+                .periodEnd(b.getPeriodEnd())
+                .answersPerPeriod(b.getEffectiveAnswersLimit())
+                .kbPages(b.getEffectiveKbPagesLimit())
+                .agents(b.getEffectiveAgentsLimit())
+                .users(b.getEffectiveUsersLimit())
+                .pendingChange(pendingChange)
                 .build();
     }
 
+    // -------------------------------------------------------------------------
+    // §2.1 Available Plans
+    // -------------------------------------------------------------------------
+
     @Override
+    @Transactional(readOnly = true)
+    public List<PlanDto> getAvailablePlans(Long companyId,
+                                            BillingPlanLimit.BillingInterval billingInterval) {
+        return subscriptionManagementService
+                .getAvailablePlans(companyId, billingInterval)
+                .getPlans();
+    }
+
+    // -------------------------------------------------------------------------
+    // §1.5 Available Boosts
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<AddonDto> getAvailableBoosts(Long companyId,
+                                              BillingPlanLimit.BillingInterval billingInterval) {
+        return planManagementService.getAvailableBoosts(companyId, billingInterval);
+    }
+
+    // -------------------------------------------------------------------------
+    // §1.6 Overview (aggregator)
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public BillingOverviewDto getOverview(Long companyId,
+                                           BillingPlanLimit.BillingInterval billingInterval) {
+        // Aggregate all dashboard data in one call
+        List<NotificationDto> notifications = getNotifications(companyId, true, null, 20);
+        Long unreadCount = (long) notifications.size();
+        CurrentPlanDto currentPlan = getCurrentPlan(companyId);
+        BillingSnapshotDto snapshot = getBillingSnapshot(companyId);
+        UsageMetricsDto usageMetrics = getUsageMetrics(companyId);
+        List<AddonDto> boosts = getAvailableBoosts(companyId, billingInterval);
+
+        return BillingOverviewDto.builder()
+                .notifications(notifications)
+                .unreadCount(unreadCount)
+                .currentPlan(currentPlan)
+                .billingSnapshot(snapshot)
+                .usageMetrics(usageMetrics)
+                .availableBoosts(boosts)
+                .build();
+    }
+
+    // -------------------------------------------------------------------------
+    // §3 Invoices
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
     public Page<InvoiceDto> getInvoices(Long companyId, int page, int size) {
-        log.info("Fetching invoices for company: {}", companyId);
-
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-        try {
-            InvoiceListParams params = InvoiceListParams.builder()
-                    .setCustomer(billing.getStripeCustomerId())
-                    .setLimit((long) size)
-                    .build();
-
-            List<Invoice> invoices = Invoice.list(params).getData();
-
-            List<InvoiceDto> invoiceDtos = invoices.stream()
-                    .map(this::convertToInvoiceDto)
-                    .collect(Collectors.toList());
-
-            return new PageImpl<>(invoiceDtos, PageRequest.of(page, size), invoiceDtos.size());
-
-        } catch (StripeException e) {
-            log.error("Failed to fetch invoices", e);
-            return Page.empty();
-        }
+        return invoiceService.getInvoicesByCompanyId(companyId, page, size);
     }
 
     @Override
-    public List<PaymentMethodDto> getPaymentMethods(Long companyId) {
-        log.info("Fetching payment methods for company: {}", companyId);
+    @Transactional(readOnly = true)
+    public UpcomingInvoiceDto getUpcomingInvoice(Long companyId) {
+        CompanyBilling billing = getBilling(companyId);
 
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-        try {
-            PaymentMethodListParams params = PaymentMethodListParams.builder()
-                    .setCustomer(billing.getStripeCustomerId())
-                    .setType(PaymentMethodListParams.Type.CARD)
-                    .build();
-
-            List<PaymentMethod> paymentMethods = PaymentMethod.list(params).getData();
-
-            return paymentMethods.stream()
-                    .map(this::convertToPaymentMethodDto)
-                    .collect(Collectors.toList());
-
-        } catch (StripeException e) {
-            log.error("Failed to fetch payment methods", e);
-            return Collections.emptyList();
-        }
-    }
-
-    @Override
-    public List<NotificationDto> getNotifications(Long companyId, boolean unreadOnly) {
-        log.info("Fetching notifications for company: {}", companyId);
-
-        // TODO: Implement notifications table and fetch from there
-        // For now, return empty list
-        return Collections.emptyList();
-    }
-
-    @Override
-    public void markNotificationAsRead(Long notificationId) {
-        log.info("Marking notification {} as read", notificationId);
-
-        // TODO: Implement notification update
-    }
-
-    @Override
-    public UsageHistoryDto getUsageHistory(Long companyId, int days) {
-        log.info("Fetching usage history for company {} ({} days)", companyId, days);
-
-        // TODO: Implement by querying billing_usage_logs
-        // For now, return empty history
-
-        return UsageHistoryDto.builder()
-                .dailyAnswerCounts(new HashMap<>())
-                .dailyKbPageChanges(new HashMap<>())
-                .totalAnswers(0)
-                .totalKbPages(0)
-                .averageAnswersPerDay(0.0)
-                .trend("stable")
-                .build();
-    }
-
-    @Override
-    public Page<EntitlementHistoryDto> getEntitlementHistory(Long companyId, int page, int size) {
-        log.info("Fetching entitlement history for company: {}", companyId);
-
-        Page<BillingEntitlementHistory> historyPage = entitlementHistoryRepository
-                .findByCompanyIdOrderByCreatedAtDesc(companyId, PageRequest.of(page, size));
-
-        List<EntitlementHistoryDto> dtos = historyPage.getContent().stream()
-                .map(this::convertToEntitlementHistoryDto)
-                .collect(Collectors.toList());
-
-        return new PageImpl<>(dtos, PageRequest.of(page, size), historyPage.getTotalElements());
-    }
-
-    private PaymentMethodDto getDefaultPaymentMethod(String customerId) {
-        try {
-            Customer customer = Customer.retrieve(customerId);
-            String defaultPmId = customer.getInvoiceSettings().getDefaultPaymentMethod();
-
-            if (defaultPmId != null) {
-                PaymentMethod pm = PaymentMethod.retrieve(defaultPmId);
-                return convertToPaymentMethodDto(pm);
-            }
-        } catch (StripeException e) {
-            log.error("Failed to fetch default payment method", e);
+        if (billing.getStripeSubscriptionId() == null) {
+            return null;
         }
 
-        return null;
-    }
-
-    private UpcomingInvoiceDto getUpcomingInvoice(String customerId) {
         try {
-            com.stripe.param.InvoiceUpcomingParams params =
-                    com.stripe.param.InvoiceUpcomingParams.builder()
-                            .setCustomer(customerId)
-                            .build();
-
-            Invoice invoice = Invoice.upcoming(params);
+            Invoice upcoming = Invoice.upcoming(
+                    InvoiceUpcomingParams.builder()
+                            .setSubscription(billing.getStripeSubscriptionId())
+                            .build());
 
             return UpcomingInvoiceDto.builder()
-                    .amountDue((int) (long)invoice.getAmountDue())
-                    .subtotal((int)(long) invoice.getSubtotal())
-                    .total((int)(long) invoice.getTotal())
-                    .currency(invoice.getCurrency())
-                    .periodStart(LocalDateTime.ofEpochSecond(
-                            invoice.getPeriodStart(), 0, java.time.ZoneOffset.UTC))
-                    .periodEnd(LocalDateTime.ofEpochSecond(
-                            invoice.getPeriodEnd(), 0, java.time.ZoneOffset.UTC))
+                    .amount(upcoming.getAmountDue() != null
+                            ? upcoming.getAmountDue().intValue() : 0)
+                    .amountFormatted(formatCents(upcoming.getAmountDue() != null
+                            ? upcoming.getAmountDue().intValue() : 0))
+                    .subtotal(upcoming.getSubtotal() != null
+                            ? upcoming.getSubtotal().intValue() : 0)
+                    .subtotalFormatted(formatCents(upcoming.getSubtotal() != null
+                            ? upcoming.getSubtotal().intValue() : 0))
+                    .taxAmount(upcoming.getTax() != null
+                            ? upcoming.getTax().intValue() : 0)
+                    .taxAmountFormatted(formatCents(upcoming.getTax() != null
+                            ? upcoming.getTax().intValue() : 0))
+                    .invoiceDate(upcoming.getPeriodEnd() != null
+                            ? epochToLdt(upcoming.getPeriodEnd()) : null)
+                    .currency(upcoming.getCurrency() != null ? upcoming.getCurrency() : "usd")
                     .build();
 
         } catch (StripeException e) {
-            log.error("Failed to fetch upcoming invoice", e);
+            log.warn("Could not fetch upcoming invoice for companyId={}: {}", companyId, e.getMessage());
             return null;
         }
     }
 
-    private List<String> buildAlerts(CompanyBilling billing, UsageMetricsDto metrics) {
-        List<String> alerts = new ArrayList<>();
-
-        if (billing.getAnswersBlocked()) {
-            alerts.add("Answer generation is blocked. Upgrade your plan to continue.");
-        }
-
-        if (metrics.getAnswersPercentageUsed() > 80) {
-            alerts.add("You've used " + metrics.getAnswersPercentageUsed() +
-                    "% of your answer limit.");
-        }
-
-        if (billing.getCancelAtPeriodEnd()) {
-            alerts.add("Your subscription will cancel on " + billing.getPeriodEnd());
-        }
-
-        if (billing.getPaymentFailureDate() != null) {
-            alerts.add("Payment failed. Please update your payment method.");
-        }
-
-        return alerts;
+    @Override
+    @Transactional(readOnly = true)
+    public byte[] downloadInvoicePdf(Long companyId, String invoiceId) {
+        return invoiceService.downloadInvoicePdf(companyId, invoiceId);
     }
 
-    private Double calculatePercentage(Integer used, Integer limit) {
-        if (limit == null || limit == 0) return 0.0;
-        return (used.doubleValue() / limit.doubleValue()) * 100;
+    // -------------------------------------------------------------------------
+    // Payment Methods
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<PaymentMethodDto> getPaymentMethods(Long companyId) {
+        return paymentMethodRepository.findByCompanyId(companyId)
+                .stream().map(this::toPaymentMethodDto)
+                .collect(Collectors.toList());
     }
 
-    private InvoiceDto convertToInvoiceDto(Invoice invoice) {
-        return InvoiceDto.builder()
-                .stripeInvoiceId(invoice.getId())
-                .invoiceNumber(invoice.getNumber())
-                .status(invoice.getStatus())
-                .amountDue((int)(long) invoice.getAmountDue())
-                .amountPaid((int)(long) invoice.getAmountPaid())
-                .subtotal((int)(long) invoice.getSubtotal())
-                .total((int)(long) invoice.getTotal())
-                .currency(invoice.getCurrency())
-                .invoiceDate(LocalDateTime.ofEpochSecond(
-                        invoice.getCreated(), 0, java.time.ZoneOffset.UTC))
-                .hostedInvoiceUrl(invoice.getHostedInvoiceUrl())
-                .invoicePdfUrl(invoice.getInvoicePdf())
+    // -------------------------------------------------------------------------
+    // §1.1 Notifications
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<NotificationDto> getNotifications(Long companyId, boolean unreadOnly,
+                                                    BillingNotification.NotificationType type,
+                                                    int limit) {
+        List<NotificationDto> results;
+
+        if (unreadOnly) {
+            results = notificationService.getUnreadNotifications(companyId);
+        } else {
+            results = notificationService
+                    .getNotifications(companyId, 0, limit)
+                    .getContent();
+        }
+
+        // Apply type filter if provided
+        if (type != null) {
+            results = results.stream()
+                    .filter(n -> n.getType() == type)
+                    .collect(Collectors.toList());
+        }
+
+        // Apply limit
+        if (results.size() > limit) {
+            results = results.subList(0, limit);
+        }
+
+        return results;
+    }
+
+    @Override
+    @Transactional
+    public void markNotificationAsRead(Long notificationId) {
+        notificationService.markAsRead(notificationId);
+    }
+
+    @Override
+    @Transactional
+    public int markAllNotificationsAsRead(Long companyId) {
+        return notificationService.markAllAsRead(companyId);
+    }
+
+    @Override
+    @Transactional
+    public void dismissNotification(Long notificationId) {
+        notificationService.deleteNotification(notificationId);
+    }
+
+    // -------------------------------------------------------------------------
+    // §4 Usage History
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public UsageHistoryDto getUsageHistory(Long companyId, int days) {
+        Map<String, Integer> dailyAnswers =
+                usageAnalyticsService.getDailyAnswerUsage(companyId, days);
+
+        int totalAnswers = dailyAnswers.values().stream()
+                .mapToInt(Integer::intValue).sum();
+
+        return UsageHistoryDto.builder()
+                .dailyAnswers(dailyAnswers)
+                .days(days)
+                .totalAnswers(totalAnswers)
                 .build();
     }
 
-    private PaymentMethodDto convertToPaymentMethodDto(PaymentMethod pm) {
-        PaymentMethod.Card card = pm.getCard();
+    // -------------------------------------------------------------------------
+    // Entitlement History
+    // -------------------------------------------------------------------------
+
+    @Override
+    @Transactional(readOnly = true)
+    public Page<EntitlementHistoryDto> getEntitlementHistory(Long companyId, int page, int size) {
+        return entitlementHistoryRepository
+                .findByCompanyIdOrderByCreatedAtDesc(companyId, PageRequest.of(page, size))
+                .map(this::toHistoryDto);
+    }
+
+    // -------------------------------------------------------------------------
+    // Converters
+    // -------------------------------------------------------------------------
+
+    private PaymentMethodDto toPaymentMethodDto(BillingPaymentMethod pm) {
+        boolean expiringSoon = false;
+        if (pm.getCardExpYear() != null && pm.getCardExpMonth() != null
+                && !Boolean.TRUE.equals(pm.getIsExpired())) {
+            LocalDateTime expiry = LocalDateTime.of(
+                    pm.getCardExpYear(), pm.getCardExpMonth(), 1, 0, 0)
+                    .plusMonths(1).minusDays(1);
+            long daysLeft = java.time.temporal.ChronoUnit.DAYS.between(
+                    LocalDateTime.now(), expiry);
+            expiringSoon = daysLeft <= 30 && daysLeft > 0;
+        }
 
         return PaymentMethodDto.builder()
-                .stripePaymentMethodId(pm.getId())
+                .id(pm.getId())
+                .stripePaymentMethodId(pm.getStripePaymentMethodId())
                 .type(pm.getType())
-                .cardBrand(card.getBrand())
-                .cardLast4(card.getLast4())
-                .cardExpMonth(card.getExpMonth().intValue())
-                .cardExpYear(card.getExpYear().intValue())
+                .isDefault(pm.getIsDefault())
+                .cardBrand(pm.getCardBrand())
+                .cardLast4(pm.getCardLast4())
+                .cardExpMonth(pm.getCardExpMonth())
+                .cardExpYear(pm.getCardExpYear())
+                .isExpired(pm.getIsExpired())
+                .isExpiringSoon(expiringSoon)
                 .build();
     }
 
-    private EntitlementHistoryDto convertToEntitlementHistoryDto(BillingEntitlementHistory history) {
+    private EntitlementHistoryDto toHistoryDto(BillingEntitlementHistory h) {
         return EntitlementHistoryDto.builder()
-                .id(history.getId())
-                .changeType(history.getChangeType())
-                .oldPlanCode(history.getOldPlanCode())
-                .newPlanCode(history.getNewPlanCode())
-                .oldAddonCodes(history.getOldAddonCodes())
-                .newAddonCodes(history.getNewAddonCodes())
-                .oldAnswersLimit(history.getOldAnswersLimit())
-                .newAnswersLimit(history.getNewAnswersLimit())
-                .oldKbPagesLimit(history.getOldKbPagesLimit())
-                .newKbPagesLimit(history.getNewKbPagesLimit())
-                .oldAgentsLimit(history.getOldAgentsLimit())
-                .newAgentsLimit(history.getNewAgentsLimit())
-                .oldUsersLimit(history.getOldUsersLimit())
-                .newUsersLimit(history.getNewUsersLimit())
-                .triggeredBy(history.getTriggeredBy())
-                .stripeEventId(history.getStripeEventId())
-                .effectiveDate(history.getEffectiveDate())
-                .createdAt(history.getCreatedAt())
+                .id(h.getId())
+                .companyId(h.getCompanyId())
+                .changeType(h.getChangeType())
+                .oldPlanCode(h.getOldPlanCode())
+                .newPlanCode(h.getNewPlanCode())
+                .oldAddonCodes(h.getOldAddonCodes())
+                .newAddonCodes(h.getNewAddonCodes())
+                .oldAnswersLimit(h.getOldAnswersLimit())
+                .newAnswersLimit(h.getNewAnswersLimit())
+                .oldKbPagesLimit(h.getOldKbPagesLimit())
+                .newKbPagesLimit(h.getNewKbPagesLimit())
+                .oldAgentsLimit(h.getOldAgentsLimit())
+                .newAgentsLimit(h.getNewAgentsLimit())
+                .oldUsersLimit(h.getOldUsersLimit())
+                .newUsersLimit(h.getNewUsersLimit())
+                .triggeredBy(h.getTriggeredBy())
+                .stripeEventId(h.getStripeEventId())
+                .effectiveDate(h.getEffectiveDate())
+                .createdAt(h.getCreatedAt())
                 .build();
     }
 
-    @Override
-    public UpcomingInvoiceDto getUpcomingInvoice(Long companyId) {
-        log.info("Fetching upcoming invoice for company: {}", companyId);
-
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-        if (billing.getStripeSubscriptionId() == null) {
-            throw new RuntimeException("No active subscription found");
-        }
-
-        try {
-            com.stripe.param.InvoiceUpcomingParams params =
-                    com.stripe.param.InvoiceUpcomingParams.builder()
-                            .setCustomer(billing.getStripeCustomerId())
-                            .setSubscription(billing.getStripeSubscriptionId())
-                            .build();
-
-            com.stripe.model.Invoice upcomingInvoice = com.stripe.model.Invoice.upcoming(params);
-
-            return UpcomingInvoiceDto.builder()
-                    .amountDue(upcomingInvoice.getAmountDue() != null ?
-                            upcomingInvoice.getAmountDue().intValue() : 0)
-                    .currency(upcomingInvoice.getCurrency())
-                    .periodStart(LocalDateTime.ofEpochSecond(
-                            upcomingInvoice.getPeriodStart(), 0, java.time.ZoneOffset.UTC))
-                    .periodEnd(LocalDateTime.ofEpochSecond(
-                            upcomingInvoice.getPeriodEnd(), 0, java.time.ZoneOffset.UTC))
-                    .build();
-
-        } catch (com.stripe.exception.StripeException e) {
-            log.error("Failed to fetch upcoming invoice for company {}", companyId, e);
-            throw new RuntimeException("Failed to fetch upcoming invoice: " + e.getMessage());
-        }
+    private UsageMetricsDto.MetricDto buildMetric(Integer used, Integer limit,
+                                                    Boolean blocked, LocalDateTime resetDate) {
+        int u = used != null ? used : 0;
+        int l = limit != null ? limit : 0;
+        int remaining = Math.max(0, l - u);
+        double pct = l > 0 ? (u * 100.0 / l) : 0.0;
+        return UsageMetricsDto.MetricDto.builder()
+                .used(u).limit(l).remaining(remaining)
+                .percentage(pct)
+                .isBlocked(Boolean.TRUE.equals(blocked))
+                .resetDate(resetDate)
+                .build();
     }
 
-    @Override
-    public byte[] downloadInvoicePdf(Long companyId, String invoiceId) {
-        log.info("Downloading invoice PDF {} for company {}", invoiceId, companyId);
-
-        CompanyBilling billing = companyBillingService.getCompanyBilling(companyId);
-
-        try {
-            com.stripe.model.Invoice invoice = com.stripe.model.Invoice.retrieve(invoiceId);
-
-            // Verify invoice belongs to this customer
-            if (!invoice.getCustomer().equals(billing.getStripeCustomerId())) {
-                throw new RuntimeException("Invoice does not belong to this company");
-            }
-
-            // Get PDF URL and download
-            String pdfUrl = invoice.getInvoicePdf();
-            if (pdfUrl == null) {
-                throw new RuntimeException("PDF not available for this invoice");
-            }
-
-            // Download PDF bytes
-            java.net.URL url = java.net.URI.create(pdfUrl).toURL();
-            try (java.io.InputStream in = url.openStream()) {
-                return in.readAllBytes();
-            }
-
-        } catch (Exception e) {
-            log.error("Failed to download invoice PDF for company {}", companyId, e);
-            throw new RuntimeException("Failed to download invoice PDF: " + e.getMessage());
-        }
+    private CompanyBilling getBilling(Long companyId) {
+        return companyBillingRepository.findByCompanyId(companyId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "CompanyBilling", "companyId", companyId));
     }
 
+    private LocalDateTime epochToLdt(Long epoch) {
+        if (epoch == null) return null;
+        return Instant.ofEpochSecond(epoch).atZone(ZoneOffset.UTC).toLocalDateTime();
+    }
+
+    private String formatCents(Integer cents) {
+        if (cents == null) return "$0.00";
+        return String.format("$%.2f", cents / 100.0);
+    }
 }

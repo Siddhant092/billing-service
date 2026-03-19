@@ -1,20 +1,39 @@
 package com.broadnet.billing.entity;
 
 import jakarta.persistence.*;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
 
 import java.time.LocalDateTime;
 
 /**
- * Entity for billing_webhook_events table
- * Stores Stripe webhook events for idempotency and debugging
+ * Entity for billing_webhook_events table.
+ * Idempotency store for Stripe webhook payloads.
+ *
+ * Architecture Plan: Core Tables §8
+ *
+ * CHANGES FROM ORIGINAL:
+ * - REMOVED: status field (not in architecture plan schema — was an invention)
+ * - REMOVED: lastRetryAt field (not in architecture plan schema — was an invention)
+ * - payload column definition corrected: schema says JSON NOT NULL, not TEXT
+ *   (kept as String in Java — Hibernate maps String + columnDefinition JSON correctly)
+ * - Added @Table indexes to match schema: idx_processed, idx_subscription
+ * - Added @Table unique constraint: uk_stripe_event_id
+ *
+ * NOTE: Do NOT add fields not in the architecture plan without explicit approval.
+ * The 'status' and 'lastRetryAt' fields were additions not defined in the schema.
  */
 @Entity
-@Table(name = "billing_webhook_events")
+@Table(
+        name = "billing_webhook_events",
+        uniqueConstraints = {
+                @UniqueConstraint(name = "uk_stripe_event_id", columnNames = "stripe_event_id")
+        },
+        indexes = {
+                @Index(name = "idx_processed",   columnList = "processed, created_at"),
+                @Index(name = "idx_subscription", columnList = "stripe_subscription_id")
+        }
+)
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -37,8 +56,13 @@ public class BillingWebhookEvent {
     @Column(name = "stripe_subscription_id")
     private String stripeSubscriptionId;
 
-    @Column(name = "payload", nullable = false, columnDefinition = "TEXT")
-    private String payload;  // ✅ FIXED: Changed from Map to String (stores JSON as text)
+    /**
+     * Full Stripe webhook JSON payload stored as text.
+     * Schema: payload JSON NOT NULL
+     * Stored as String in Java — enables replay and debugging.
+     */
+    @Column(name = "payload", nullable = false, columnDefinition = "JSON")
+    private String payload;
 
     @Column(name = "processed", nullable = false)
     @Builder.Default
@@ -53,15 +77,6 @@ public class BillingWebhookEvent {
     @Column(name = "retry_count", nullable = false)
     @Builder.Default
     private Integer retryCount = 0;
-
-    // ✅ NEW FIELD: Added for tracking processing status
-    @Column(name = "status", length = 20)
-    @Builder.Default
-    private String status = "pending";  // pending, processing, completed, failed
-
-    // ✅ NEW FIELD: Added for retry tracking
-    @Column(name = "last_retry_at", columnDefinition = "DATETIME(6)")
-    private LocalDateTime lastRetryAt;
 
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false, columnDefinition = "DATETIME(6)")
