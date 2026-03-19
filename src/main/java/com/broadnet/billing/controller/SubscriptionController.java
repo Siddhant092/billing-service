@@ -1,4 +1,4 @@
 package com.broadnet.billing.controller;
 
-public class StripeWebhookController {
+public class SubscriptionController {
 }

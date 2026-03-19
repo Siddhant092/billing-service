@@ -1,4 +1,4 @@
 package com.broadnet.billing.dto;
 
-public class AddonDeltaDto {
+public class EnterprisePricingDto {
 }
